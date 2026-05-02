@@ -1,0 +1,8 @@
+[package]
+name = "sub_font_loader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+walkdir = "2.5.0"
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
