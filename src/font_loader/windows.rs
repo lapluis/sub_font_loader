@@ -1,10 +1,10 @@
 use std::{os::windows::ffi::OsStrExt, path::Path};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use windows_sys::Win32::{
     Foundation::{LPARAM, WPARAM},
     Graphics::Gdi::{AddFontResourceW, RemoveFontResourceW},
-    UI::WindowsAndMessaging::{SendMessageW, HWND_BROADCAST, WM_FONTCHANGE},
+    UI::WindowsAndMessaging::{HWND_BROADCAST, SendMessageW, WM_FONTCHANGE},
 };
 
 fn to_wide_path(path: &Path) -> Vec<u16> {
