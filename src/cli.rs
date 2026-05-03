@@ -20,8 +20,4 @@ pub struct Cli {
     /// keep the temporary extraction directory when the input is an archive
     #[argh(switch)]
     pub keep_extracted: bool,
-
-    /// print the load report as JSON
-    #[argh(switch)]
-    pub json: bool,
 }

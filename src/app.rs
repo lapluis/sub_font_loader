@@ -7,12 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{
-    cli::Cli,
-    discover, input,
-    report::{self, LoadReport},
-    session::FontSession,
-};
+use crate::{cli::Cli, discover, input, session::FontSession};
 
 pub fn run(cli: Cli) -> Result<()> {
     let shutdown = Shutdown::install()?;
@@ -28,27 +23,13 @@ pub fn run(cli: Cli) -> Result<()> {
         })?;
 
     let mut session = FontSession::new();
-    let load_summary = session.load_fonts(discovered.clone())?;
-
-    report::print_load_report(
-        &LoadReport {
-            input: prepared.original_path(),
-            source: prepared.source().as_str(),
-            scan_root: prepared.scan_root(),
-            extracted_to: prepared.extracted_to(),
-            recursive: !cli.no_recursive,
-            discovered: &discovered,
-            load: &load_summary,
-        },
-        cli.json,
-    )?;
+    session.load_fonts(discovered)?;
 
     if !cli.no_hold && session.loaded_count() > 0 {
-        shutdown.wait_for_enter_or_ctrl_c(cli.json)?;
+        shutdown.wait_for_enter_or_ctrl_c()?;
     }
 
-    let unload_summary = session.unload_all()?;
-    report::print_unload_report(&unload_summary, cli.json)?;
+    session.unload_all()?;
 
     Ok(())
 }
@@ -77,7 +58,7 @@ impl Shutdown {
         Ok(Self { tx, rx })
     }
 
-    fn wait_for_enter_or_ctrl_c(&self, json: bool) -> Result<ShutdownSignal> {
+    fn wait_for_enter_or_ctrl_c(&self) -> Result<ShutdownSignal> {
         match self.rx.try_recv() {
             Ok(signal) => return Ok(signal),
             Err(TryRecvError::Empty) => {}
@@ -93,13 +74,9 @@ impl Shutdown {
             let _ = enter_tx.send(ShutdownSignal::Enter);
         });
 
-        if json {
-            eprintln!("Press Enter or Ctrl+C to unload and exit.");
-        } else {
-            println!(
-                "The fonts are now visible to other programs. Press Enter or Ctrl+C to unload and exit."
-            );
-        }
+        println!(
+            "The fonts are now visible to other programs. Press Enter or Ctrl+C to unload and exit."
+        );
 
         self.rx.recv().context("failed to wait for Enter or Ctrl+C")
     }

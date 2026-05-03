@@ -7,7 +7,6 @@ use crate::font_loader::windows;
 #[derive(Debug, Clone)]
 pub struct LoadedFont {
     pub path: PathBuf,
-    pub resource_count: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -46,11 +45,8 @@ impl FontSession {
 
         for path in paths {
             match windows::add_font_resource(&path) {
-                Ok(resource_count) => {
-                    let loaded = LoadedFont {
-                        path,
-                        resource_count,
-                    };
+                Ok(_) => {
+                    let loaded = LoadedFont { path };
                     self.loaded.push(loaded.clone());
                     summary.loaded.push(loaded);
                 }

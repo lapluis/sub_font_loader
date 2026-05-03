@@ -4,7 +4,6 @@ mod cli;
 mod discover;
 mod font_loader;
 mod input;
-mod report;
 mod session;
 
 fn main() -> anyhow::Result<()> {
