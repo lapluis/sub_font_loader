@@ -1,3 +1,5 @@
+use sub_font_loader::{discover, input, session};
+
 use std::{
     io,
     path::PathBuf,
@@ -6,10 +8,35 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use argh::FromArgs;
+use session::FontSession;
 
-use crate::{cli::Cli, discover, input, session::FontSession};
+/// temporarily load fonts from a directory or archive
+#[derive(Debug, FromArgs)]
+struct Cli {
+    /// directory or archive to scan; defaults to the current directory
+    #[argh(positional)]
+    input: Option<PathBuf>,
 
-pub fn run(cli: Cli) -> Result<()> {
+    /// scan only the top level of the input directory or extracted archive
+    #[argh(switch)]
+    no_recursive: bool,
+
+    /// unload immediately after loading instead of waiting for Enter or Ctrl+C
+    #[argh(switch)]
+    no_hold: bool,
+
+    /// keep the temporary extraction directory when the input is an archive
+    #[argh(switch)]
+    keep_extracted: bool,
+}
+
+fn main() -> Result<()> {
+    let cli: Cli = argh::from_env();
+    run(cli)
+}
+
+fn run(cli: Cli) -> Result<()> {
     let shutdown = Shutdown::install()?;
     let input = cli.input.unwrap_or_else(|| PathBuf::from("."));
     let prepared = input::prepare_input(&input, cli.keep_extracted)
