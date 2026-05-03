@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 argh = "0.1.19"
 ctrlc = "3.5.2"
+encoding_rs = "0.8.35"
 sevenz-rust2 = { version = "0.21.0", default-features = false, features = ["util"] }
 tempfile = "3.27.0"
 unrar-ng = "0.7.5"
