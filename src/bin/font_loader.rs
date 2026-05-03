@@ -50,10 +50,11 @@ fn run(cli: Cli) -> Result<()> {
         })?;
 
     if discovered.is_empty() {
-        anyhow::bail!(
-            "no supported font files (.ttf, .otf, .ttc) found in {}",
+        eprintln!(
+            "No supported font files (.ttf, .otf, .ttc) found in {}.",
             prepared.scan_root().display()
         );
+        return Ok(());
     }
 
     let mut session = FontSession::new();

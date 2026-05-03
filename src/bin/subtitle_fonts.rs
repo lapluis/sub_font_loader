@@ -27,10 +27,11 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to discover subtitle files in {}", input.display()))?;
 
     if subtitles.is_empty() {
-        anyhow::bail!(
-            "no supported subtitle files (.ass, .ssa) found in {}",
+        eprintln!(
+            "No supported subtitle files (.ass, .ssa) found in {}.",
             input.display()
         );
+        return Ok(());
     }
 
     let report = subtitle::analyze_subtitle_font_report(&subtitles)?;
