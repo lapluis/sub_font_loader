@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
 argh = "0.1.19"
+compress-tools = "0.16.1"
+ctrlc = "3.5.2"
+tempfile = "3.27.0"
 walkdir = "2.5.0"
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
