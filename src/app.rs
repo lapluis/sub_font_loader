@@ -22,8 +22,20 @@ pub fn run(cli: Cli) -> Result<()> {
             )
         })?;
 
+    if discovered.is_empty() {
+        anyhow::bail!(
+            "no supported font files (.ttf, .otf, .ttc) found in {}",
+            prepared.scan_root().display()
+        );
+    }
+
     let mut session = FontSession::new();
-    session.load_fonts(discovered)?;
+    let summary = session.load_fonts(discovered)?;
+    println!(
+        "Loaded {} font file{}.",
+        summary.loaded.len(),
+        if summary.loaded.len() == 1 { "" } else { "s" }
+    );
 
     if !cli.no_hold && session.loaded_count() > 0 {
         shutdown.wait_for_enter_or_ctrl_c()?;
