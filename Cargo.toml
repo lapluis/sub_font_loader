@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argh = "0.1.19"
 walkdir = "2.5.0"
-windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }

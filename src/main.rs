@@ -1,26 +1,11 @@
 use std::{
-    ffi::OsStr,
     io,
-    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use walkdir::WalkDir;
-use windows_sys::Win32::{
-    Graphics::Gdi::{AddFontResourceW, RemoveFontResourceW},
-    UI::WindowsAndMessaging::{SendMessageW, HWND_BROADCAST, WM_FONTCHANGE},
-};
 
-fn to_wide_null(s: &OsStr) -> Vec<u16> {
-    s.encode_wide().chain(Some(0)).collect()
-}
-
-fn broadcast_font_change() {
-    unsafe {
-        // wParam/lParam are unused, so 0 is fine.
-        SendMessageW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
-    }
-}
+mod windows_api_wrapper;
 
 #[derive(Default)]
 pub struct SessionFontLoader {
@@ -35,23 +20,14 @@ impl SessionFontLoader {
     pub fn load_font_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<i32> {
         let path = path.as_ref();
 
-        let wide = to_wide_null(path.as_os_str());
-
-        let count = unsafe { AddFontResourceW(wide.as_ptr()) };
-
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("AddFontResourceW failed: {}", path.display()),
-            ));
-        }
+        let count = windows_api_wrapper::add_font_resource(path).map_err(io::Error::other)?;
 
         self.loaded.push(path.to_path_buf());
         Ok(count)
     }
 
     pub fn load_font_dir<P: AsRef<Path>>(&mut self, dir: P) -> io::Result<usize> {
-        let mut loaded_files = 0usize;
+        let mut font_files = Vec::new();
 
         for entry in WalkDir::new(dir) {
             let entry = entry?;
@@ -67,33 +43,36 @@ impl SessionFontLoader {
 
             let ext = ext.to_ascii_lowercase();
             if matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
-                match self.load_font_file(path) {
-                    Ok(_) => loaded_files += 1,
-                    Err(err) => {
-                        eprintln!("Failed to load: {}: {}", path.display(), err);
-                    }
-                }
+                font_files.push(path.to_path_buf());
             }
         }
 
-        if loaded_files > 0 {
-            broadcast_font_change();
+        if font_files.is_empty() {
+            return Ok(0);
         }
 
+        let paths = font_files.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        let loaded_files =
+            windows_api_wrapper::add_font_resources(&paths).map_err(io::Error::other)?;
+
+        self.loaded.extend(font_files);
         Ok(loaded_files)
     }
 
     pub fn unload_all(&mut self) {
-        for path in self.loaded.iter().rev() {
-            let wide = to_wide_null(path.as_os_str());
-
-            unsafe {
-                RemoveFontResourceW(wide.as_ptr());
+        let paths = self
+            .loaded
+            .iter()
+            .rev()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        if !paths.is_empty() {
+            if let Err(err) = windows_api_wrapper::remove_font_resources(&paths) {
+                eprintln!("{}", err);
             }
         }
 
         self.loaded.clear();
-        broadcast_font_change();
     }
 }
 
