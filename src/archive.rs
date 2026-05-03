@@ -188,16 +188,13 @@ pub fn extract_rar(archive: &Path, destination: &Path) -> Result<()> {
 
         create_parent_dirs(&output_path)
             .with_context(|| format!("failed to prepare RAR entry {}", output_path.display()))?;
-        let (data, next_cursor) = entry_cursor
-            .read()
-            .with_context(|| format!("failed to extract RAR entry {}", entry_name.display()))?;
-        fs::write(&output_path, data).with_context(|| {
+        cursor = entry_cursor.extract_to(&output_path).with_context(|| {
             format!(
-                "failed to write extracted RAR file {}",
+                "failed to extract RAR entry {} to {}",
+                entry_name.display(),
                 output_path.display()
             )
         })?;
-        cursor = next_cursor;
     }
 
     Ok(())
