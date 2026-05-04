@@ -321,7 +321,7 @@ impl FontIndex {
             });
         }
 
-        let total_font_files = u64_to_usize(meta.total_font_files);
+        let total_font_files = usize::try_from(meta.total_font_files).unwrap_or(usize::MAX);
         let mut summary = ScanSummary {
             root: root_path.clone(),
             indexed_files: total_font_files,
@@ -438,19 +438,6 @@ impl FontIndex {
         Ok(matches)
     }
 
-    pub fn query_alias(&self, font_name: &str) -> Result<Vec<FontMatch>> {
-        self.query_name(font_name)
-    }
-
-    pub fn query_alias_with_style(
-        &self,
-        font_name: &str,
-        weight_class: Option<u16>,
-        is_italic: Option<bool>,
-    ) -> Result<Vec<FontMatch>> {
-        self.query_name_with_style(font_name, weight_class, is_italic)
-    }
-
     pub fn resolve_required_fonts<I, S>(&self, required_names: I) -> Result<ResolveReport>
     where
         I: IntoIterator<Item = S>,
@@ -541,7 +528,9 @@ impl FontIndex {
                         name.name,
                         name.name_norm,
                         name.face_index.to_string(),
-                        optional_u16_text(name.weight_class),
+                        name.weight_class
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
                         name.is_italic.to_string(),
                         name.name_id.to_string(),
                         name.platform_id.to_string(),
@@ -556,10 +545,6 @@ impl FontIndex {
             .flush()
             .context("failed to flush font name CSV writer")?;
         Ok(())
-    }
-
-    pub fn export_aliases_csv<W: Write>(&self, writer: W) -> Result<()> {
-        self.export_names_csv(writer)
     }
 
     fn read_meta_record(&self) -> Result<Option<MetaRecord>> {
@@ -708,7 +693,10 @@ pub fn canonicalize_font_root(root: &Path) -> Result<PathBuf> {
         bail!("font root is not a directory: {}", root.display());
     }
 
-    Ok(canonicalize_path(root))
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    Ok(PathBuf::from(normalize_windows_verbatim_path(
+        &root.to_string_lossy(),
+    )))
 }
 
 fn initialize_store(db: &Database) -> Result<()> {
@@ -828,7 +816,9 @@ fn collect_name_records(analysis: &FontFileAnalysis) -> Vec<FontNameRecord> {
 
     for face in &analysis.faces {
         for name in &face.name_records {
-            if !is_indexed_name_id(name.name_id) || !is_indexed_platform_id(name.platform_id) {
+            if !INDEXED_NAME_IDS.contains(&name.name_id)
+                || !is_indexed_platform_id(name.platform_id)
+            {
                 continue;
             }
 
@@ -883,7 +873,7 @@ fn build_reverse_index_records(
 
     for (relative_path, record) in forward_records {
         for name in &record.names {
-            if is_reverse_name_id(name.name_id) {
+            if REVERSE_NAME_IDS.contains(&name.name_id) {
                 reverse_records
                     .entry(name.name_norm.clone())
                     .or_default()
@@ -1000,14 +990,6 @@ fn name_kind(name_id: u16) -> &'static str {
     }
 }
 
-fn is_indexed_name_id(name_id: u16) -> bool {
-    INDEXED_NAME_IDS.contains(&name_id)
-}
-
-fn is_reverse_name_id(name_id: u16) -> bool {
-    REVERSE_NAME_IDS.contains(&name_id)
-}
-
 fn is_indexed_platform_id(platform_id: u16) -> bool {
     matches!(platform_id, 0 | 1 | 3)
 }
@@ -1031,22 +1013,21 @@ fn relative_path_text(root: &Path, path: &Path) -> Result<String> {
             root.display()
         )
     })?;
-    slash_separated_path(relative)
-}
-
-fn slash_separated_path(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
 
-    for component in path.components() {
+    for component in relative.components() {
         match component {
             Component::Normal(value) => parts.push(value.to_string_lossy().into_owned()),
             Component::CurDir => {}
-            _ => bail!("font path is not relative: {}", path.display()),
+            _ => bail!("font path is not relative: {}", relative.display()),
         }
     }
 
     if parts.is_empty() {
-        bail!("font path has no relative file name: {}", path.display());
+        bail!(
+            "font path has no relative file name: {}",
+            relative.display()
+        );
     }
 
     Ok(parts.join("/"))
@@ -1060,11 +1041,6 @@ fn relative_path_to_path_buf(relative_path: &str) -> PathBuf {
         }
     }
     path
-}
-
-fn canonicalize_path(path: &Path) -> PathBuf {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    PathBuf::from(normalize_windows_verbatim_path(&path.to_string_lossy()))
 }
 
 fn path_to_db_text(path: &Path) -> String {
@@ -1085,38 +1061,18 @@ fn paths_equal_text(left: &str, right: &str) -> bool {
     left == right || left.eq_ignore_ascii_case(right)
 }
 
-fn optional_u16_text(value: Option<u16>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_default()
-}
-
 fn unix_timestamp_now() -> i64 {
-    system_time_to_unix_timestamp(SystemTime::now())
-}
-
-fn system_time_to_unix_timestamp(value: SystemTime) -> i64 {
-    match value.duration_since(UNIX_EPOCH) {
-        Ok(duration) => u64_to_i64(duration.as_secs()),
-        Err(_) => 0,
-    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn system_time_to_unix_timestamp_nanos(value: SystemTime) -> i64 {
-    match value.duration_since(UNIX_EPOCH) {
-        Ok(duration) => u128_to_i64(duration.as_nanos()),
-        Err(_) => 0,
-    }
-}
-
-fn u64_to_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn u128_to_i64(value: u128) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn u64_to_usize(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
+    value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

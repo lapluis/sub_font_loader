@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{fs::File, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use argh::FromArgs;
@@ -38,14 +34,21 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    let output_dir = output_dir(&cli.db_path);
+    let output_dir = cli
+        .db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     let meta_path = output_dir.join("meta.json");
     let forward_index_path = output_dir.join("forward_index.csv");
     let reverse_index_path = output_dir.join("reverse_index.csv");
 
     let db = Database::open(&cli.db_path)
         .with_context(|| format!("failed to open redb database {}", cli.db_path.display()))?;
-    let meta = read_current_meta_record(&db)?;
+    let read_txn = db
+        .begin_read()
+        .context("failed to start redb font index read transaction")?;
+    let meta = read_current_meta_record(&read_txn)?;
 
     let meta_file = File::create(&meta_path)
         .with_context(|| format!("failed to create {}", meta_path.display()))?;
@@ -54,12 +57,12 @@ fn run(cli: Cli) -> Result<()> {
 
     let forward_index_file = File::create(&forward_index_path)
         .with_context(|| format!("failed to create {}", forward_index_path.display()))?;
-    let forward_rows = export_forward_index_csv(&db, forward_index_file)
+    let forward_rows = export_forward_index_csv(&read_txn, forward_index_file)
         .with_context(|| format!("failed to export {}", forward_index_path.display()))?;
 
     let reverse_index_file = File::create(&reverse_index_path)
         .with_context(|| format!("failed to create {}", reverse_index_path.display()))?;
-    let reverse_rows = export_reverse_index_csv(&db, reverse_index_file)
+    let reverse_rows = export_reverse_index_csv(&read_txn, reverse_index_file)
         .with_context(|| format!("failed to export {}", reverse_index_path.display()))?;
 
     println!("Exported redb font index tables:");
@@ -68,13 +71,6 @@ fn run(cli: Cli) -> Result<()> {
     println!("  {} ({reverse_rows} row(s))", reverse_index_path.display());
 
     Ok(())
-}
-
-fn output_dir(db_path: &Path) -> &Path {
-    db_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
 }
 
 fn export_meta_json<W: Write>(mut writer: W, meta: &MetaRecord) -> Result<()> {
@@ -86,7 +82,10 @@ fn export_meta_json<W: Write>(mut writer: W, meta: &MetaRecord) -> Result<()> {
     Ok(())
 }
 
-fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize> {
+fn export_forward_index_csv<W: Write>(
+    read_txn: &redb::ReadTransaction,
+    writer: W,
+) -> Result<usize> {
     let mut csv_writer = csv::Writer::from_writer(writer);
     csv_writer
         .write_record([
@@ -98,11 +97,6 @@ fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
             "names_json",
         ])
         .context("failed to write forward index CSV header")?;
-
-    let read_txn = db
-        .begin_read()
-        .context("failed to start redb font index read transaction")?;
-    read_current_meta_record_from_txn(&read_txn)?;
 
     let forward_table = read_txn
         .open_table(FORWARD_INDEX_TABLE)
@@ -140,16 +134,14 @@ fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
     Ok(row_count)
 }
 
-fn export_reverse_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize> {
+fn export_reverse_index_csv<W: Write>(
+    read_txn: &redb::ReadTransaction,
+    writer: W,
+) -> Result<usize> {
     let mut csv_writer = csv::Writer::from_writer(writer);
     csv_writer
         .write_record(["name_norm", "relative_path"])
         .context("failed to write reverse index CSV header")?;
-
-    let read_txn = db
-        .begin_read()
-        .context("failed to start redb font index read transaction")?;
-    read_current_meta_record_from_txn(&read_txn)?;
 
     let reverse_table = read_txn
         .open_table(REVERSE_INDEX_TABLE)
@@ -161,11 +153,16 @@ fn export_reverse_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
         .context("failed to iterate redb font index reverse table")?
     {
         let (key, value) = entry.context("failed to read redb font index reverse row")?;
-        let name_norm = key.value().to_owned();
+        let name_norm = key.value();
 
-        for relative_path in decode_reverse_paths(value.value()) {
+        for relative_path in value
+            .value()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             csv_writer
-                .write_record([name_norm.clone(), relative_path])
+                .write_record([name_norm, relative_path])
                 .context("failed to write reverse index CSV row")?;
             row_count += 1;
         }
@@ -177,41 +174,22 @@ fn export_reverse_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
     Ok(row_count)
 }
 
-fn read_current_meta_record(db: &Database) -> Result<MetaRecord> {
-    let read_txn = db
-        .begin_read()
-        .context("failed to start redb font index read transaction")?;
-    read_current_meta_record_from_txn(&read_txn)
-}
+fn read_current_meta_record(read_txn: &redb::ReadTransaction) -> Result<MetaRecord> {
+    let meta_table = read_txn
+        .open_table(META_TABLE)
+        .context("failed to open redb font index meta table")?;
+    let meta = meta_table
+        .get(META_KEY)
+        .context("failed to read redb font index metadata")?
+        .map(|value| decode::<MetaRecord>(value.value()))
+        .transpose()?
+        .context("redb font index metadata is missing")?;
 
-fn read_current_meta_record_from_txn(read_txn: &redb::ReadTransaction) -> Result<MetaRecord> {
-    let meta =
-        read_meta_record_from_txn(read_txn)?.context("redb font index metadata is missing")?;
     if meta.schema_version != SCHEMA_VERSION {
         bail!("redb font index schema is outdated; update the font index first");
     }
 
     Ok(meta)
-}
-
-fn read_meta_record_from_txn(read_txn: &redb::ReadTransaction) -> Result<Option<MetaRecord>> {
-    let meta_table = read_txn
-        .open_table(META_TABLE)
-        .context("failed to open redb font index meta table")?;
-    meta_table
-        .get(META_KEY)
-        .context("failed to read redb font index metadata")?
-        .map(|value| decode(value.value()))
-        .transpose()
-}
-
-fn decode_reverse_paths(value: &str) -> Vec<String> {
-    value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {

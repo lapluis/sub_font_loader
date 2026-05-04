@@ -28,10 +28,10 @@ fn main() -> Result<()> {
     let mut printed = 0usize;
 
     for family in &families {
-        if let Some(filter) = &filter {
-            if !family.to_lowercase().contains(filter) {
-                continue;
-            }
+        if let Some(filter) = &filter
+            && !family.to_lowercase().contains(filter)
+        {
+            continue;
         }
 
         println!("{family}");
@@ -52,8 +52,10 @@ fn main() -> Result<()> {
 
 fn enumerate_font_families(include_vertical: bool) -> Result<BTreeSet<String>> {
     let _dc = ScreenDeviceContext::get()?;
-    let mut query = LOGFONTW::default();
-    query.lfCharSet = DEFAULT_CHARSET;
+    let query = LOGFONTW {
+        lfCharSet: DEFAULT_CHARSET,
+        ..Default::default()
+    };
 
     let mut collector = FontFamilyCollector {
         families: BTreeSet::new(),
