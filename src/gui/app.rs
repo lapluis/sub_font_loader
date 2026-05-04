@@ -50,7 +50,6 @@ struct MainWindow {
     change_dir_btn: gui::Button,
     update_btn: gui::Button,
     load_btn: gui::Button,
-    unload_btn: gui::Button,
     result_edit: gui::Edit,
     status_edit: gui::Edit,
 }
@@ -89,7 +88,6 @@ impl MainWindow {
         let change_dir_btn = button(&wnd, commands::BTN_CHANGE_FONT_DIR, 585, 10, 160);
         let update_btn = button(&wnd, commands::BTN_UPDATE_INDEX, 12, 44, 120);
         let load_btn = button(&wnd, commands::BTN_LOAD_SUBTITLES, 144, 44, 120);
-        let unload_btn = button(&wnd, commands::BTN_UNLOAD_FONTS, 276, 44, 110);
         let result_edit = gui::Edit::new(
             &wnd,
             gui::EditOpts {
@@ -138,7 +136,6 @@ impl MainWindow {
             change_dir_btn,
             update_btn,
             load_btn,
-            unload_btn,
             result_edit,
             status_edit,
         };
@@ -179,22 +176,25 @@ impl MainWindow {
         let app = self.clone();
         let state_for_load = Arc::clone(&state);
         self.load_btn.on().bn_clicked(move || {
-            if let Some(paths) = app.choose_subtitle_inputs()? {
+            if state_for_load.lock().unwrap().has_active_load() {
+                app.start_unload(Arc::clone(&state_for_load));
+            } else if let Some(paths) = app.choose_subtitle_inputs()? {
                 app.start_load_inputs(Arc::clone(&state_for_load), paths);
             }
             Ok(())
         });
 
         let app = self.clone();
-        let state_for_unload = Arc::clone(&state);
-        self.unload_btn.on().bn_clicked(move || {
-            app.start_unload(Arc::clone(&state_for_unload));
-            Ok(())
-        });
-
-        let app = self.clone();
         let state_for_drop = Arc::clone(&state);
         self.wnd.on().wm_drop_files(move |params| {
+            let reject_drop = {
+                let state = state_for_drop.lock().unwrap();
+                state.is_busy || state.has_active_load()
+            };
+            if reject_drop {
+                return Ok(());
+            }
+
             let dropped_paths = params
                 .hdrop
                 .DragQueryFile()?
@@ -311,6 +311,11 @@ impl MainWindow {
                 return;
             }
 
+            if state.has_active_load() {
+                self.show_message("Unload the current fonts before loading another subtitle.");
+                return;
+            }
+
             if !state.index_status.is_ready() {
                 state.load_status =
                     LoadStatus::Failed("build or update the font index first".to_owned());
@@ -338,7 +343,7 @@ impl MainWindow {
     fn start_unload(&self, state: Arc<Mutex<AppState>>) {
         let task = {
             let mut state = state.lock().unwrap();
-            if state.is_busy || state.loaded_font_count() == 0 {
+            if state.is_busy || !state.has_active_load() {
                 return;
             }
 
@@ -411,20 +416,12 @@ impl MainWindow {
                         "Font directory switched.\r\nUnloaded fonts: {unloaded_count}"
                     ));
                 }
-                GuiEvent::FontsLoaded {
-                    view,
-                    session,
-                    unloaded_before_load,
-                } => {
+                GuiEvent::FontsLoaded { view, session } => {
                     let rendered = view.render_text();
                     state.font_session = Some(session);
                     state.last_view = Some(view.clone());
                     state.load_status = LoadStatus::Loaded(view);
                     let _ = self.set_report_text(&rendered);
-
-                    if unloaded_before_load > 0 {
-                        state.last_subtitle_inputs.shrink_to_fit();
-                    }
                 }
                 GuiEvent::FontsUnloaded {
                     session,
@@ -473,14 +470,19 @@ impl MainWindow {
         ));
 
         let idle = !state.is_busy;
+        let has_active_load = state.has_active_load();
+        let load_button_text = if has_active_load {
+            commands::BTN_UNLOAD_FONTS
+        } else {
+            commands::BTN_LOAD_SUBTITLES
+        };
+        let _ = self.load_btn.hwnd().SetWindowText(load_button_text);
+        self.wnd.hwnd().DragAcceptFiles(idle && !has_active_load);
         self.change_dir_btn.hwnd().EnableWindow(idle);
         self.update_btn.hwnd().EnableWindow(idle);
         self.load_btn
             .hwnd()
-            .EnableWindow(idle && state.index_status.is_ready());
-        self.unload_btn
-            .hwnd()
-            .EnableWindow(idle && state.loaded_font_count() > 0);
+            .EnableWindow(idle && (has_active_load || state.index_status.is_ready()));
     }
 
     fn set_report_text(&self, text: &str) -> w::SysResult<()> {

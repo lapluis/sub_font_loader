@@ -45,6 +45,10 @@ impl AppState {
             .map(FontSession::loaded_count)
             .unwrap_or_default()
     }
+
+    pub fn has_active_load(&self) -> bool {
+        matches!(&self.load_status, LoadStatus::Loaded(_)) || self.loaded_font_count() > 0
+    }
 }
 
 #[derive(Debug, Clone)]

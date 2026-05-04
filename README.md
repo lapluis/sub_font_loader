@@ -135,7 +135,7 @@ Open the native Windows GUI:
 cargo run --bin sub_font_loader_gui
 ```
 
-The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose names are already available from system-installed fonts. Switching the font directory rebuilds the index for the new root; the Update Index button performs incremental updates for the current root.
+The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose names are already available from system-installed fonts. Switching the font directory rebuilds the index for the new root; the Update Index button performs incremental updates for the current root. The Load Subtitles button changes to Unload Fonts after a load completes, and additional loads or drag-and-drop inputs are ignored until the current load is unloaded.
 
 ```toml
 font_root = ""

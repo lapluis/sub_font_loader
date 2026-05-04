@@ -53,7 +53,6 @@ pub enum GuiEvent {
     FontsLoaded {
         view: SubtitleLoadView,
         session: FontSession,
-        unloaded_before_load: usize,
     },
     FontsUnloaded {
         session: FontSession,
@@ -134,7 +133,6 @@ fn run_task_inner(task: GuiTask) -> Result<GuiEvent> {
             Ok(GuiEvent::FontsLoaded {
                 view: loaded.view,
                 session: current_session,
-                unloaded_before_load: loaded.unloaded_before_load,
             })
         }
         GuiTask::UnloadFonts { mut session } => {
@@ -178,7 +176,6 @@ fn update_index(font_root: &Path, db_path: &Path) -> Result<ScanSummary> {
 
 struct SubtitleLoadResult {
     view: SubtitleLoadView,
-    unloaded_before_load: usize,
 }
 
 fn load_subtitles(
@@ -218,9 +215,6 @@ fn load_subtitles(
 
     let index = FontIndex::open(db_path)?;
     let resolve_report = index.resolve_required_fonts(&local_aliases)?;
-    let unload_summary = session
-        .unload_all()
-        .context("failed to unload previously loaded fonts")?;
     let load_summary = session
         .load_fonts(resolve_report.unique_font_paths.clone())
         .context("failed to load resolved local fonts")?;
@@ -234,10 +228,7 @@ fn load_subtitles(
         &load_summary,
     );
 
-    Ok(SubtitleLoadResult {
-        view,
-        unloaded_before_load: unload_summary.unloaded.len(),
-    })
+    Ok(SubtitleLoadResult { view })
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
