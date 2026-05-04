@@ -1,12 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
 };
 
-use crate::{
-    font::index::ResolveReport,
-    session::{FailedFont, LoadSummary},
-};
+use crate::{font::index::ResolveReport, session::LoadSummary};
 
 #[derive(Debug, Clone, Default)]
 pub struct SubtitleLoadView {
@@ -24,16 +21,7 @@ pub struct SubtitleLoadView {
 pub struct LocalFontGroup {
     pub font_path: PathBuf,
     pub loaded: bool,
-    pub load_error: Option<String>,
-    pub aliases: Vec<AliasMatchView>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AliasMatchView {
-    pub requested_name: String,
-    pub matched_alias: String,
-    pub alias_kind: String,
-    pub face_index: u32,
+    pub aliases: Vec<String>,
 }
 
 impl SubtitleLoadView {
@@ -45,7 +33,6 @@ impl SubtitleLoadView {
         load_summary: &LoadSummary,
     ) -> Self {
         let loaded_paths = path_set(load_summary.loaded.iter().map(|font| &font.path));
-        let failed_paths = failed_path_map(&load_summary.failed);
         let mut groups = BTreeMap::<PathBuf, LocalFontGroup>::new();
 
         for resolved in report.matched {
@@ -55,26 +42,16 @@ impl SubtitleLoadView {
                     .entry(font_path.clone())
                     .or_insert_with(|| LocalFontGroup {
                         loaded: loaded_paths.contains(&font_path),
-                        load_error: failed_paths.get(&font_path).cloned(),
                         font_path: font_path.clone(),
                         aliases: Vec::new(),
                     });
 
-                group.aliases.push(AliasMatchView {
-                    requested_name: resolved.requested_name.clone(),
-                    matched_alias: font_match.matched_alias,
-                    alias_kind: font_match.alias_kind,
-                    face_index: font_match.face_index,
-                });
+                push_unique_alias(&mut group.aliases, font_match.matched_alias);
             }
         }
 
         let mut local_groups = groups.into_values().collect::<Vec<_>>();
-        for group in &mut local_groups {
-            group
-                .aliases
-                .sort_by(|left, right| left.requested_name.cmp(&right.requested_name));
-        }
+        local_groups.retain(|group| group.loaded);
 
         let loaded_local_font_count = local_groups.iter().filter(|group| group.loaded).count();
         let missing_aliases = report.missing;
@@ -118,50 +95,28 @@ impl SubtitleLoadView {
         );
         output.push('\n');
 
+        push_line(&mut output, "[LOCAL LOADED]".to_owned());
         for group in &self.local_groups {
-            if group.loaded {
-                push_line(
-                    &mut output,
-                    format!("[LOCAL LOADED] {}", group.font_path.display()),
-                );
-            } else {
-                push_line(
-                    &mut output,
-                    format!("[LOCAL LOAD FAILED] {}", group.font_path.display()),
-                );
-                if let Some(error) = &group.load_error {
-                    push_line(&mut output, format!("  Error: {error}"));
-                }
-            }
+            push_line(
+                &mut output,
+                format!("- {}", font_file_label(&group.font_path)),
+            );
 
             for alias in &group.aliases {
-                push_line(
-                    &mut output,
-                    format!("  - Requested: {}", alias.requested_name),
-                );
-                push_line(
-                    &mut output,
-                    format!("    Matched alias: {}", alias.matched_alias),
-                );
-                push_line(&mut output, format!("    Alias kind: {}", alias.alias_kind));
-                push_line(&mut output, format!("    Face index: {}", alias.face_index));
+                push_line(&mut output, format!("  {alias}"));
             }
-            output.push('\n');
         }
+        output.push('\n');
 
-        if !self.system_aliases.is_empty() {
-            push_line(&mut output, "[SYSTEM SKIPPED]".to_owned());
-            for alias in &self.system_aliases {
-                push_line(&mut output, format!("  - {alias}"));
-            }
-            output.push('\n');
+        push_line(&mut output, "[SYSTEM SKIPPED]".to_owned());
+        for alias in &self.system_aliases {
+            push_line(&mut output, format!("- {alias}"));
         }
+        output.push('\n');
 
-        if !self.missing_aliases.is_empty() {
-            push_line(&mut output, "[MISSING]".to_owned());
-            for alias in &self.missing_aliases {
-                push_line(&mut output, format!("  - {alias}"));
-            }
+        push_line(&mut output, "[MISSING]".to_owned());
+        for alias in &self.missing_aliases {
+            push_line(&mut output, format!("- {alias}"));
         }
 
         output
@@ -172,14 +127,104 @@ fn path_set<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> BTreeSet<PathBuf> {
     paths.cloned().collect()
 }
 
-fn failed_path_map(failed: &[FailedFont]) -> HashMap<PathBuf, String> {
-    failed
-        .iter()
-        .map(|font| (font.path.clone(), font.error.clone()))
-        .collect()
+fn push_unique_alias(aliases: &mut Vec<String>, alias: String) {
+    if !aliases.iter().any(|existing| existing == &alias) {
+        aliases.push(alias);
+    }
+}
+
+fn font_file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn push_line(output: &mut String, line: String) {
     output.push_str(&line);
     output.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubtitleLoadView;
+    use crate::{
+        font::index::{FontMatch, ResolveReport, ResolvedFont},
+        session::{LoadSummary, LoadedFont},
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn render_text_uses_compact_sections_and_deduplicated_aliases() {
+        let loaded_path = PathBuf::from("Fonts").join("Alpha.ttf");
+        let failed_path = PathBuf::from("Fonts").join("Beta.ttf");
+        let report = ResolveReport {
+            matched: vec![
+                ResolvedFont {
+                    requested_name: "Alpha Family".to_owned(),
+                    matches: vec![
+                        font_match(&loaded_path, "Alpha Family", "family"),
+                        font_match(&loaded_path, "Alpha Family", "full_name"),
+                        font_match(&loaded_path, "AlphaPS", "postscript_name"),
+                    ],
+                },
+                ResolvedFont {
+                    requested_name: "Beta Family".to_owned(),
+                    matches: vec![font_match(&failed_path, "Beta Family", "family")],
+                },
+            ],
+            missing: vec!["Missing Serif".to_owned()],
+            unique_font_paths: vec![loaded_path.clone(), failed_path.clone()],
+        };
+        let load_summary = LoadSummary {
+            loaded: vec![LoadedFont { path: loaded_path }],
+            failed: Vec::new(),
+        };
+
+        let view = SubtitleLoadView::from_resolve_report(
+            13,
+            4,
+            vec!["System Sans".to_owned()],
+            report,
+            &load_summary,
+        );
+
+        assert_eq!(
+            view.render_text(),
+            concat!(
+                "Loaded local fonts: 1\n",
+                "Skipped system fonts: 1\n",
+                "Missing fonts: 1\n",
+                "Subtitle files: 13\n",
+                "Required aliases: 4\n",
+                "\n",
+                "[LOCAL LOADED]\n",
+                "- Alpha.ttf\n",
+                "  Alpha Family\n",
+                "  AlphaPS\n",
+                "\n",
+                "[SYSTEM SKIPPED]\n",
+                "- System Sans\n",
+                "\n",
+                "[MISSING]\n",
+                "- Missing Serif\n",
+            )
+        );
+    }
+
+    fn font_match(path: &PathBuf, matched_alias: &str, alias_kind: &str) -> FontMatch {
+        FontMatch {
+            requested_name: matched_alias.to_owned(),
+            matched_alias: matched_alias.to_owned(),
+            alias_kind: alias_kind.to_owned(),
+            font_path: path.clone(),
+            canonical_path: path.clone(),
+            face_index: 0,
+            family_name: None,
+            subfamily_name: None,
+            full_name: None,
+            postscript_name: None,
+            weight_class: None,
+            is_italic: false,
+        }
+    }
 }
