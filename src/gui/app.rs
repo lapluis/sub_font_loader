@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     env,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -227,7 +228,7 @@ impl MainWindow {
         startup_inputs: Vec<PathBuf>,
     ) -> w::AnyResult<()> {
         self.wnd.hwnd().DragAcceptFiles(true);
-        self.result_edit.set_text("")?;
+        self.set_report_text("")?;
 
         let auto_index = {
             let mut state = state.lock().unwrap();
@@ -282,7 +283,7 @@ impl MainWindow {
             state.index_status = IndexStatus::Building;
             state.load_status = LoadStatus::Idle;
             state.is_busy = true;
-            let _ = self.result_edit.set_text("");
+            let _ = self.set_report_text("");
 
             GuiTask::SwitchFontRoot {
                 old_session: state.font_session.take().unwrap_or_else(FontSession::new),
@@ -420,7 +421,7 @@ impl MainWindow {
                     state.font_session = Some(session);
                     state.index_status = IndexStatus::from_summary(&summary);
                     state.load_status = LoadStatus::Idle;
-                    let _ = self.result_edit.set_text(&format!(
+                    let _ = self.set_report_text(&format!(
                         "Font directory switched.\r\nUnloaded fonts: {unloaded_count}"
                     ));
                 }
@@ -433,7 +434,7 @@ impl MainWindow {
                     state.font_session = Some(session);
                     state.last_view = Some(view.clone());
                     state.load_status = LoadStatus::Loaded(view);
-                    let _ = self.result_edit.set_text(&rendered);
+                    let _ = self.set_report_text(&rendered);
 
                     if unloaded_before_load > 0 {
                         state.last_subtitle_inputs.shrink_to_fit();
@@ -445,9 +446,7 @@ impl MainWindow {
                 } => {
                     state.font_session = Some(session);
                     state.load_status = LoadStatus::Idle;
-                    let _ = self
-                        .result_edit
-                        .set_text(&format!("Unloaded fonts: {unloaded_count}"));
+                    let _ = self.set_report_text(&format!("Unloaded fonts: {unloaded_count}"));
                 }
                 GuiEvent::Error(error) => {
                     if matches!(
@@ -497,6 +496,11 @@ impl MainWindow {
         self.unload_btn
             .hwnd()
             .EnableWindow(idle && state.loaded_font_count() > 0);
+    }
+
+    fn set_report_text(&self, text: &str) -> w::SysResult<()> {
+        let text = edit_multiline_text(text);
+        self.result_edit.set_text(&text)
     }
 
     fn choose_subtitle_inputs(&self) -> w::AnyResult<Option<Vec<PathBuf>>> {
@@ -584,6 +588,38 @@ fn button(wnd: &gui::WindowMain, text: &'static str, x: i32, y: i32, width: i32)
     )
 }
 
+fn edit_multiline_text(text: &str) -> Cow<'_, str> {
+    if !needs_edit_line_ending_normalization(text) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                normalized.push_str("\r\n");
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                }
+            }
+            '\n' => normalized.push_str("\r\n"),
+            _ => normalized.push(ch),
+        }
+    }
+
+    Cow::Owned(normalized)
+}
+
+fn needs_edit_line_ending_normalization(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| match byte {
+        b'\n' => index == 0 || bytes[index - 1] != b'\r',
+        b'\r' => bytes.get(index + 1) != Some(&b'\n'),
+        _ => false,
+    })
+}
+
 fn create_open_dialog() -> w::AnyResult<w::IFileOpenDialog> {
     Ok(w::CoCreateInstance::<w::IFileOpenDialog>(
         &co::CLSID::FileOpenDialog,
@@ -628,4 +664,28 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
         || left
             .to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::edit_multiline_text;
+    use std::borrow::Cow;
+
+    #[test]
+    fn edit_multiline_text_converts_lf_to_crlf() {
+        assert_eq!(edit_multiline_text("one\ntwo").as_ref(), "one\r\ntwo");
+    }
+
+    #[test]
+    fn edit_multiline_text_preserves_existing_crlf() {
+        assert!(matches!(
+            edit_multiline_text("one\r\ntwo"),
+            Cow::Borrowed("one\r\ntwo")
+        ));
+    }
+
+    #[test]
+    fn edit_multiline_text_converts_bare_cr_to_crlf() {
+        assert_eq!(edit_multiline_text("one\rtwo").as_ref(), "one\r\ntwo");
+    }
 }
