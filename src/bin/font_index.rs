@@ -42,7 +42,7 @@ struct ScanCommand {
 #[derive(Debug, FromArgs)]
 #[argh(subcommand, name = "query")]
 struct QueryCommand {
-    /// font name or alias to query
+    /// font name to query
     #[argh(positional)]
     font_name: String,
 
@@ -64,7 +64,7 @@ struct ResolveSubtitlesCommand {
     db: Option<PathBuf>,
 }
 
-/// export indexed aliases to a CSV file
+/// export indexed names to a CSV file
 #[derive(Debug, FromArgs)]
 #[argh(subcommand, name = "export-csv")]
 struct ExportCsvCommand {
@@ -100,7 +100,7 @@ fn scan(command: ScanCommand) -> Result<()> {
 fn query(command: QueryCommand) -> Result<()> {
     let db_path = db_path(command.db);
     let index = FontIndex::open(&db_path)?;
-    let matches = index.query_alias(&command.font_name)?;
+    let matches = index.query_name(&command.font_name)?;
 
     if matches.is_empty() {
         println!("No matches for: {}", command.font_name);
@@ -146,7 +146,7 @@ fn export_csv(command: ExportCsvCommand) -> Result<()> {
         .with_context(|| format!("failed to create CSV file {}", command.csv_path.display()))?;
 
     index
-        .export_aliases_csv(file)
+        .export_names_csv(file)
         .with_context(|| format!("failed to export CSV file {}", command.csv_path.display()))?;
     println!("CSV written to: {}", command.csv_path.display());
     Ok(())
@@ -171,15 +171,13 @@ fn print_scan_summary(summary: &ScanSummary) {
 fn print_query_matches(matches: &[FontMatch]) {
     for font_match in matches {
         println!("Requested: {}", font_match.requested_name);
-        println!("Matched alias: {}", font_match.matched_alias);
-        println!("Alias kind: {}", font_match.alias_kind);
+        println!("Matched name: {}", font_match.matched_name);
+        println!("Name kind: {}", font_match.name_kind);
         println!("Relative path: {}", font_match.relative_path);
         println!("Name ID: {}", font_match.name_id);
         println!(
             "Platform/encoding/language: {}/{}/{}",
-            optional_u16_text(font_match.platform_id),
-            optional_u16_text(font_match.encoding_id),
-            optional_u16_text(font_match.language_id)
+            font_match.platform_id, font_match.encoding_id, font_match.language_id
         );
         println!("Path: {}", font_match.font_path.display());
         println!();
@@ -197,8 +195,8 @@ fn print_resolve_report(report: &ResolveReport) {
             for font_match in &resolved.matches {
                 println!(
                     "    {} [{}] {}",
-                    font_match.matched_alias,
-                    font_match.alias_kind,
+                    font_match.matched_name,
+                    font_match.name_kind,
                     font_match.font_path.display()
                 );
             }
@@ -238,10 +236,4 @@ fn print_set(title: &str, values: &BTreeSet<String>) {
     for value in values {
         println!("  {value}");
     }
-}
-
-fn optional_u16_text(value: Option<u16>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned())
 }

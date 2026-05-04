@@ -15,11 +15,28 @@ const ALIAS_NAME_IDS: &[u16] = &[
     name_id::FULL_NAME,
     name_id::POST_SCRIPT_NAME,
 ];
+const INDEX_NAME_IDS: &[u16] = &[
+    name_id::FAMILY,
+    name_id::SUBFAMILY,
+    name_id::FULL_NAME,
+    name_id::POST_SCRIPT_NAME,
+    name_id::TYPOGRAPHIC_FAMILY,
+    name_id::TYPOGRAPHIC_SUBFAMILY,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontAlias {
     pub name_id: u16,
     pub platform_id: String,
+    pub encoding_id: u16,
+    pub language_id: u16,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontName {
+    pub name_id: u16,
+    pub platform_id: u16,
     pub encoding_id: u16,
     pub language_id: u16,
     pub value: String,
@@ -34,6 +51,7 @@ pub struct FontFaceAnalysis {
     pub postscript_name: Option<String>,
     pub weight_class: Option<u16>,
     pub is_italic: bool,
+    pub name_records: Vec<FontName>,
     pub aliases: Vec<FontAlias>,
 }
 
@@ -109,7 +127,9 @@ fn is_usable_name(value: &str) -> bool {
 
 fn analyze_face(face_index: u32, face: &Face<'_>) -> FontFaceAnalysis {
     let mut seen = HashSet::new();
+    let mut seen_name_records = HashSet::new();
     let mut aliases = Vec::new();
+    let mut name_records = Vec::new();
     let mut family_name = None;
     let mut subfamily_name = None;
     let mut full_name = None;
@@ -135,6 +155,27 @@ fn analyze_face(face_index: u32, face: &Face<'_>) -> FontFaceAnalysis {
                 prefer_name(&mut postscript_name, &name, &value);
             }
             _ => {}
+        }
+
+        if INDEX_NAME_IDS.contains(&name.name_id)
+            && let Some(platform_id) = platform_id_value(name.platform_id)
+        {
+            let name_key = (
+                name.name_id,
+                platform_id,
+                name.encoding_id,
+                name.language_id,
+                value.to_lowercase(),
+            );
+            if seen_name_records.insert(name_key) {
+                name_records.push(FontName {
+                    name_id: name.name_id,
+                    platform_id,
+                    encoding_id: name.encoding_id,
+                    language_id: name.language_id,
+                    value: value.clone(),
+                });
+            }
         }
 
         if !ALIAS_NAME_IDS.contains(&name.name_id) {
@@ -163,6 +204,7 @@ fn analyze_face(face_index: u32, face: &Face<'_>) -> FontFaceAnalysis {
         postscript_name: postscript_name.map(|(_, value)| value),
         weight_class: Some(face.weight().to_number()),
         is_italic: face.is_italic() || face.is_oblique(),
+        name_records,
         aliases,
     }
 }
@@ -206,6 +248,15 @@ fn platform_id_name(platform_id: PlatformId) -> &'static str {
     }
 }
 
+fn platform_id_value(platform_id: PlatformId) -> Option<u16> {
+    match platform_id {
+        PlatformId::Unicode => Some(0),
+        PlatformId::Macintosh => Some(1),
+        PlatformId::Windows => Some(3),
+        _ => None,
+    }
+}
+
 fn normalize_alias(value: &str) -> Option<String> {
     let normalized = value.trim();
 
@@ -213,5 +264,16 @@ fn normalize_alias(value: &str) -> Option<String> {
         None
     } else {
         Some(normalized.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INDEX_NAME_IDS, name_id};
+
+    #[test]
+    fn indexed_name_ids_include_typographic_names() {
+        assert!(INDEX_NAME_IDS.contains(&name_id::TYPOGRAPHIC_FAMILY));
+        assert!(INDEX_NAME_IDS.contains(&name_id::TYPOGRAPHIC_SUBFAMILY));
     }
 }

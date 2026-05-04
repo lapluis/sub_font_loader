@@ -10,7 +10,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::de::DeserializeOwned;
 use sub_font_loader::font::index::{FontFileIndexRecord, MetaRecord};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 const META_KEY: &str = "state";
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -94,10 +94,8 @@ fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
             "extension",
             "file_size",
             "modified_at",
-            "face_count",
-            "alias_count",
-            "faces_json",
-            "aliases_json",
+            "name_count",
+            "names_json",
         ])
         .context("failed to write forward index CSV header")?;
 
@@ -119,12 +117,9 @@ fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
         let relative_path = key.value().to_owned();
         let record = decode::<FontFileIndexRecord>(value.value())
             .with_context(|| format!("failed to decode font index record {relative_path}"))?;
-        let face_count = record.faces.len();
-        let alias_count = record.aliases.len();
-        let faces_json = serde_json::to_string(&record.faces)
-            .with_context(|| format!("failed to encode faces for {relative_path}"))?;
-        let aliases_json = serde_json::to_string(&record.aliases)
-            .with_context(|| format!("failed to encode aliases for {relative_path}"))?;
+        let name_count = record.names.len();
+        let names_json = serde_json::to_string(&record.names)
+            .with_context(|| format!("failed to encode names for {relative_path}"))?;
 
         csv_writer
             .write_record([
@@ -132,10 +127,8 @@ fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
                 record.extension,
                 record.file_size.to_string(),
                 record.modified_at.to_string(),
-                face_count.to_string(),
-                alias_count.to_string(),
-                faces_json,
-                aliases_json,
+                name_count.to_string(),
+                names_json,
             ])
             .context("failed to write forward index CSV row")?;
         row_count += 1;
@@ -150,7 +143,7 @@ fn export_forward_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
 fn export_reverse_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize> {
     let mut csv_writer = csv::Writer::from_writer(writer);
     csv_writer
-        .write_record(["alias_norm", "relative_path", "face_index"])
+        .write_record(["name_norm", "relative_path"])
         .context("failed to write reverse index CSV header")?;
 
     let read_txn = db
@@ -168,15 +161,11 @@ fn export_reverse_index_csv<W: Write>(db: &Database, writer: W) -> Result<usize>
         .context("failed to iterate redb font index reverse table")?
     {
         let (key, value) = entry.context("failed to read redb font index reverse row")?;
-        let alias_norm = key.value().to_owned();
+        let name_norm = key.value().to_owned();
 
-        for reverse_entry in decode_reverse_entries(value.value()) {
+        for relative_path in decode_reverse_paths(value.value()) {
             csv_writer
-                .write_record([
-                    alias_norm.clone(),
-                    reverse_entry.relative_path,
-                    reverse_entry.face_index.to_string(),
-                ])
+                .write_record([name_norm.clone(), relative_path])
                 .context("failed to write reverse index CSV row")?;
             row_count += 1;
         }
@@ -216,20 +205,12 @@ fn read_meta_record_from_txn(read_txn: &redb::ReadTransaction) -> Result<Option<
         .transpose()
 }
 
-fn decode_reverse_entries(value: &str) -> Vec<ReverseIndexEntry> {
+fn decode_reverse_paths(value: &str) -> Vec<String> {
     value
         .lines()
-        .filter_map(|line| {
-            let (relative_path, face_index) = line
-                .split_once('\t')
-                .map(|(path, face_index)| (path.to_owned(), face_index.parse::<u32>().unwrap_or(0)))
-                .unwrap_or_else(|| (line.to_owned(), 0));
-
-            (!relative_path.is_empty()).then_some(ReverseIndexEntry {
-                relative_path,
-                face_index,
-            })
-        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
         .collect()
 }
 
@@ -237,10 +218,4 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let (value, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
         .context("failed to deserialize redb font index record")?;
     Ok(value)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReverseIndexEntry {
-    relative_path: String,
-    face_index: u32,
 }

@@ -57,7 +57,7 @@ impl SubtitleLoadView {
                         aliases: Vec::new(),
                     });
 
-                push_unique_alias(&mut group.aliases, font_match.matched_alias);
+                push_unique_alias(&mut group.aliases, font_match.matched_name);
             }
         }
 
@@ -122,7 +122,7 @@ impl SubtitleLoadView {
         );
         push_line(
             &mut output,
-            format!("Required aliases: {}", self.required_alias_count),
+            format!("Required fonts: {}", self.required_alias_count),
         );
         push_line(
             &mut output,
@@ -221,14 +221,14 @@ mod tests {
                 ResolvedFont {
                     requested_name: "Alpha Family".to_owned(),
                     matches: vec![
-                        font_match(&loaded_path, "Alpha Family", "family"),
+                        font_match(&loaded_path, "Alpha Family", "family_name"),
                         font_match(&loaded_path, "Alpha Family", "full_name"),
                         font_match(&loaded_path, "AlphaPS", "postscript_name"),
                     ],
                 },
                 ResolvedFont {
                     requested_name: "Beta Family".to_owned(),
-                    matches: vec![font_match(&failed_path, "Beta Family", "family")],
+                    matches: vec![font_match(&failed_path, "Beta Family", "family_name")],
                 },
             ],
             missing: vec!["Missing Serif".to_owned()],
@@ -255,7 +255,7 @@ mod tests {
                 "Skipped system fonts: 1\n",
                 "Missing fonts: 1\n",
                 "Subtitle files: 13\n",
-                "Required aliases: 4\n",
+                "Required fonts: 4\n",
                 "Declared but unused: 1\n",
                 "\n",
                 "[LOCAL LOADED]\n",
@@ -283,11 +283,11 @@ mod tests {
             matched: vec![
                 ResolvedFont {
                     requested_name: "Alpha Family".to_owned(),
-                    matches: vec![font_match(&loaded_path, "Alpha Family", "family")],
+                    matches: vec![font_match(&loaded_path, "Alpha Family", "family_name")],
                 },
                 ResolvedFont {
                     requested_name: "Beta Family".to_owned(),
-                    matches: vec![font_match(&failed_path, "Beta Family", "family")],
+                    matches: vec![font_match(&failed_path, "Beta Family", "family_name")],
                 },
             ],
             missing: Vec::new(),
@@ -317,23 +317,19 @@ mod tests {
         assert!(rendered.contains("  failed to add font resource\n"));
     }
 
-    fn font_match(path: &Path, matched_alias: &str, alias_kind: &str) -> FontMatch {
+    fn font_match(path: &Path, matched_name: &str, name_kind: &str) -> FontMatch {
         FontMatch {
-            requested_name: matched_alias.to_owned(),
-            matched_alias: matched_alias.to_owned(),
-            alias_kind: alias_kind.to_owned(),
+            requested_name: matched_name.to_owned(),
+            matched_name: matched_name.to_owned(),
+            name_kind: name_kind.to_owned(),
             font_path: path.to_path_buf(),
             relative_path: path.display().to_string(),
             name_id: 0,
-            platform_id: None,
-            encoding_id: None,
-            language_id: None,
+            platform_id: 0,
+            encoding_id: 0,
+            language_id: 0,
             canonical_path: path.to_path_buf(),
             face_index: 0,
-            family_name: None,
-            subfamily_name: None,
-            full_name: None,
-            postscript_name: None,
             weight_class: None,
             is_italic: false,
         }

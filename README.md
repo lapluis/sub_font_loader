@@ -12,10 +12,10 @@ Inspired by [yzwduck/FontLoaderSub](https://github.com/yzwduck/FontLoaderSub).
 - Temporarily register fonts with Windows and unload them on exit
 - Parse ASS/SSA styles and override tags such as `\fn` and `\r`
 - Analyze font family, full-name, and PostScript-name aliases
-- Store searchable font aliases in a redb index
+- Store searchable font names in a redb index
 - Use a native Windows GUI to index a font directory, resolve subtitle fonts,
   and temporarily load only the local fonts that are needed
-- Export font alias data to CSV
+- Export font index name data to CSV
 
 ## Requirements
 
@@ -99,7 +99,7 @@ cargo run --bin font_analysis -- -o aliases.csv .\fonts
 
 ### `font_index`
 
-Build and query a redb font alias index. The default database path is `font_index.redb`.
+Build and query a redb font name index. The default database path is `font_index.redb`.
 
 Scan a font directory:
 
@@ -107,7 +107,7 @@ Scan a font directory:
 cargo run --bin font_index -- scan --db font_index.redb .\fonts
 ```
 
-Query one font name or alias:
+Query one font name:
 
 ```powershell
 cargo run --bin font_index -- query --db font_index.redb "Noto Sans CJK SC"
@@ -119,13 +119,13 @@ Resolve fonts required by subtitle files:
 cargo run --bin font_index -- resolve-subtitles --db font_index.redb .\subs
 ```
 
-Export indexed aliases:
+Export indexed names:
 
 ```powershell
-cargo run --bin font_index -- export-csv --db font_index.redb aliases.csv
+cargo run --bin font_index -- export-csv --db font_index.redb names.csv
 ```
 
-The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Index updates compare file path, size, and modification time, skip unchanged files, remove files that disappeared from the scan root, and analyze only new or modified font files. Family aliases retain one candidate per style attribute so Regular/Bold/Italic variants can be loaded together.
+The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Index updates compare file path, size, and modification time, skip unchanged files, remove files that disappeared from the scan root, and analyze only new or modified font files. Reverse lookup maps normalized family, full, and PostScript names to deduplicated font file paths; subfamily names are retained in the forward index for inspection.
 
 ### `sub_font_loader_gui`
 
@@ -135,7 +135,7 @@ Open the native Windows GUI:
 cargo run --bin sub_font_loader_gui
 ```
 
-The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose aliases are already available from system-installed fonts. Switching the font directory rebuilds the index for the new root; the Update Index button performs incremental updates for the current root.
+The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose names are already available from system-installed fonts. Switching the font directory rebuilds the index for the new root; the Update Index button performs incremental updates for the current root.
 
 ```toml
 font_root = ""

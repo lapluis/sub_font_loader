@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -9,7 +9,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use ttf_parser::name_id;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -17,8 +16,10 @@ use crate::discover;
 
 use super::{FontFileAnalysis, analyze_font_file};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 const META_KEY: &str = "state";
+const INDEXED_NAME_IDS: &[u16] = &[1, 2, 4, 6, 16, 17];
+const REVERSE_NAME_IDS: &[u16] = &[1, 4, 6, 16];
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const FORWARD_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("forward_index");
@@ -43,11 +44,11 @@ pub struct MetaRecord {
     pub otf_count: u64,
     pub ttc_count: u64,
 
-    pub total_aliases: u64,
-    pub family_alias_count: u64,
-    pub full_name_alias_count: u64,
-    pub postscript_alias_count: u64,
-    pub other_alias_count: u64,
+    pub total_names: u64,
+    pub family_name_count: u64,
+    pub subfamily_name_count: u64,
+    pub full_name_count: u64,
+    pub postscript_name_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,44 +61,23 @@ pub struct FontFileIndexRecord {
     /// Lowercase extension without dot, for example "ttf", "otf", or "ttc".
     pub extension: String,
 
-    pub faces: Vec<FontFaceIndexRecord>,
-    pub aliases: Vec<FontAliasRecord>,
+    pub names: Vec<FontNameRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FontFaceIndexRecord {
+pub struct FontNameRecord {
     pub face_index: u32,
-    pub family_name: Option<String>,
-    pub family_norm: Option<String>,
-    pub subfamily_name: Option<String>,
-    pub full_name: Option<String>,
-    pub postscript_name: Option<String>,
-    pub weight_class: Option<u16>,
-    pub is_italic: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FontAliasRecord {
-    pub alias_raw: String,
-    pub alias_norm: String,
-    pub alias_kind: String,
-
-    pub face_index: u32,
-    pub family_name: Option<String>,
-    pub family_norm: Option<String>,
-    pub subfamily_name: Option<String>,
-    pub full_name: Option<String>,
-    pub postscript_name: Option<String>,
-    pub weight_class: Option<u16>,
-    pub is_italic: bool,
 
     pub name_id: u16,
+    pub platform_id: u16,
+    pub encoding_id: u16,
+    pub language_id: u16,
 
-    pub platform_id: Option<u16>,
-    pub encoding_id: Option<u16>,
-    pub language_id: Option<u16>,
+    pub name: String,
+    pub name_norm: String,
 
-    pub priority: i16,
+    pub weight_class: Option<u16>,
+    pub is_italic: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -113,23 +93,17 @@ pub struct ScanSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontMatch {
     pub requested_name: String,
-    pub matched_alias: String,
-    pub alias_kind: String,
+    pub matched_name: String,
+    pub name_kind: String,
     pub font_path: PathBuf,
     pub relative_path: String,
     pub name_id: u16,
-    pub platform_id: Option<u16>,
-    pub encoding_id: Option<u16>,
-    pub language_id: Option<u16>,
+    pub platform_id: u16,
+    pub encoding_id: u16,
+    pub language_id: u16,
 
-    // Compatibility fields retained while the rest of the project moves away
-    // from face-level index data.
     pub canonical_path: PathBuf,
     pub face_index: u32,
-    pub family_name: Option<String>,
-    pub subfamily_name: Option<String>,
-    pub full_name: Option<String>,
-    pub postscript_name: Option<String>,
     pub weight_class: Option<u16>,
     pub is_italic: bool,
 }
@@ -151,19 +125,6 @@ pub struct ResolvedFont {
 struct DiscoveredFontPath {
     path: PathBuf,
     relative_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReverseIndexEntry {
-    relative_path: String,
-    face_index: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ReverseDedupeKey {
-    family_norm: String,
-    weight_class: Option<u16>,
-    is_italic: bool,
 }
 
 impl FontIndex {
@@ -376,18 +337,18 @@ impl FontIndex {
         Ok(summary)
     }
 
-    pub fn query_alias(&self, font_name: &str) -> Result<Vec<FontMatch>> {
-        self.query_alias_with_style(font_name, None, None)
+    pub fn query_name(&self, font_name: &str) -> Result<Vec<FontMatch>> {
+        self.query_name_with_style(font_name, None, None)
     }
 
-    pub fn query_alias_with_style(
+    pub fn query_name_with_style(
         &self,
         font_name: &str,
         weight_class: Option<u16>,
         is_italic: Option<bool>,
     ) -> Result<Vec<FontMatch>> {
-        let alias_norm = normalize_font_name(font_name);
-        if alias_norm.is_empty() {
+        let name_norm = normalize_font_name(font_name);
+        if name_norm.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -405,10 +366,10 @@ impl FontIndex {
         let reverse_table = read_txn
             .open_table(REVERSE_INDEX_TABLE)
             .context("failed to open redb font index reverse table")?;
-        let Some(reverse_entries) = reverse_table
-            .get(alias_norm.as_str())
+        let Some(relative_paths) = reverse_table
+            .get(name_norm.as_str())
             .context("failed to read redb font index reverse table")?
-            .map(|value| decode_reverse_entries(value.value()))
+            .map(|value| decode_reverse_paths(value.value()))
         else {
             return Ok(Vec::new());
         };
@@ -420,62 +381,74 @@ impl FontIndex {
         let mut matches = Vec::new();
         let mut seen_matches = HashSet::new();
 
-        for reverse_entry in reverse_entries {
+        for relative_path in relative_paths {
             let record = forward_table
-                .get(reverse_entry.relative_path.as_str())
+                .get(relative_path.as_str())
                 .context("failed to read redb font index forward table")?
                 .map(|value| decode::<FontFileIndexRecord>(value.value()))
                 .transpose()?
                 .with_context(|| {
-                    format!(
-                        "reverse index points to missing font record {}",
-                        reverse_entry.relative_path
-                    )
+                    format!("reverse index points to missing font record {relative_path}")
                 })?;
 
-            for alias in record.aliases.iter().filter(|alias| {
-                alias.alias_norm == alias_norm && alias.face_index == reverse_entry.face_index
-            }) {
-                if !style_matches(alias, weight_class, is_italic) {
+            for name in record
+                .names
+                .iter()
+                .filter(|name| name.name_norm == name_norm)
+            {
+                if !style_matches(name, weight_class, is_italic) {
                     continue;
                 }
 
                 let match_key = (
-                    reverse_entry.relative_path.clone(),
-                    alias.face_index,
-                    alias.alias_norm.clone(),
+                    relative_path.clone(),
+                    name.face_index,
+                    name.name_id,
+                    name.platform_id,
+                    name.encoding_id,
+                    name.language_id,
+                    name.name_norm.clone(),
                 );
                 if !seen_matches.insert(match_key) {
                     continue;
                 }
 
-                let font_path = PathBuf::from(&meta.root_path)
-                    .join(relative_path_to_path_buf(&reverse_entry.relative_path));
+                let font_path =
+                    PathBuf::from(&meta.root_path).join(relative_path_to_path_buf(&relative_path));
 
                 matches.push(FontMatch {
                     requested_name: font_name.to_owned(),
-                    matched_alias: alias.alias_raw.clone(),
-                    alias_kind: alias.alias_kind.clone(),
+                    matched_name: name.name.clone(),
+                    name_kind: name_kind(name.name_id).to_owned(),
                     font_path: font_path.clone(),
-                    relative_path: reverse_entry.relative_path.clone(),
-                    name_id: alias.name_id,
-                    platform_id: alias.platform_id,
-                    encoding_id: alias.encoding_id,
-                    language_id: alias.language_id,
+                    relative_path: relative_path.clone(),
+                    name_id: name.name_id,
+                    platform_id: name.platform_id,
+                    encoding_id: name.encoding_id,
+                    language_id: name.language_id,
                     canonical_path: font_path,
-                    face_index: alias.face_index,
-                    family_name: alias.family_name.clone(),
-                    subfamily_name: alias.subfamily_name.clone(),
-                    full_name: alias.full_name.clone(),
-                    postscript_name: alias.postscript_name.clone(),
-                    weight_class: alias.weight_class,
-                    is_italic: alias.is_italic,
+                    face_index: name.face_index,
+                    weight_class: name.weight_class,
+                    is_italic: name.is_italic,
                 });
             }
         }
 
         sort_font_matches(&mut matches);
         Ok(matches)
+    }
+
+    pub fn query_alias(&self, font_name: &str) -> Result<Vec<FontMatch>> {
+        self.query_name(font_name)
+    }
+
+    pub fn query_alias_with_style(
+        &self,
+        font_name: &str,
+        weight_class: Option<u16>,
+        is_italic: Option<bool>,
+    ) -> Result<Vec<FontMatch>> {
+        self.query_name_with_style(font_name, weight_class, is_italic)
     }
 
     pub fn resolve_required_fonts<I, S>(&self, required_names: I) -> Result<ResolveReport>
@@ -487,7 +460,7 @@ impl FontIndex {
 
         for required_name in required_names {
             let requested_name = required_name.as_ref().to_owned();
-            let matches = self.query_alias(&requested_name)?;
+            let matches = self.query_name(&requested_name)?;
 
             if matches.is_empty() {
                 report.missing.push(requested_name);
@@ -515,7 +488,7 @@ impl FontIndex {
         Ok(report)
     }
 
-    pub fn export_aliases_csv<W: Write>(&self, writer: W) -> Result<()> {
+    pub fn export_names_csv<W: Write>(&self, writer: W) -> Result<()> {
         let mut csv_writer = csv::Writer::from_writer(writer);
         csv_writer
             .write_record([
@@ -523,24 +496,17 @@ impl FontIndex {
                 "extension",
                 "file_size",
                 "modified_at",
-                "alias_raw",
-                "alias_norm",
-                "alias_kind",
+                "name",
+                "name_norm",
                 "face_index",
-                "family_name",
-                "family_norm",
-                "subfamily_name",
-                "full_name",
-                "postscript_name",
                 "weight_class",
                 "is_italic",
                 "name_id",
                 "platform_id",
                 "encoding_id",
                 "language_id",
-                "priority",
             ])
-            .context("failed to write alias CSV header")?;
+            .context("failed to write font name CSV header")?;
 
         let read_txn = self
             .db
@@ -565,38 +531,35 @@ impl FontIndex {
             let record = decode::<FontFileIndexRecord>(value.value())
                 .with_context(|| format!("failed to decode font index record {relative_path}"))?;
 
-            for alias in record.aliases {
+            for name in record.names {
                 csv_writer
                     .write_record([
                         relative_path.clone(),
                         record.extension.clone(),
                         record.file_size.to_string(),
                         record.modified_at.to_string(),
-                        alias.alias_raw,
-                        alias.alias_norm,
-                        alias.alias_kind,
-                        alias.face_index.to_string(),
-                        optional_string_text(alias.family_name),
-                        optional_string_text(alias.family_norm),
-                        optional_string_text(alias.subfamily_name),
-                        optional_string_text(alias.full_name),
-                        optional_string_text(alias.postscript_name),
-                        optional_u16_text(alias.weight_class),
-                        alias.is_italic.to_string(),
-                        alias.name_id.to_string(),
-                        optional_u16_text(alias.platform_id),
-                        optional_u16_text(alias.encoding_id),
-                        optional_u16_text(alias.language_id),
-                        alias.priority.to_string(),
+                        name.name,
+                        name.name_norm,
+                        name.face_index.to_string(),
+                        optional_u16_text(name.weight_class),
+                        name.is_italic.to_string(),
+                        name.name_id.to_string(),
+                        name.platform_id.to_string(),
+                        name.encoding_id.to_string(),
+                        name.language_id.to_string(),
                     ])
-                    .context("failed to write alias CSV row")?;
+                    .context("failed to write font name CSV row")?;
             }
         }
 
         csv_writer
             .flush()
-            .context("failed to flush alias CSV writer")?;
+            .context("failed to flush font name CSV writer")?;
         Ok(())
+    }
+
+    pub fn export_aliases_csv<W: Write>(&self, writer: W) -> Result<()> {
+        self.export_names_csv(writer)
     }
 
     fn read_meta_record(&self) -> Result<Option<MetaRecord>> {
@@ -666,11 +629,11 @@ impl FontIndex {
                 .open_table(REVERSE_INDEX_TABLE)
                 .context("failed to open redb font index reverse table")?;
 
-            for (alias_norm, entries) in build_reverse_index_records(forward_records) {
-                let encoded_entries = encode_reverse_entries(&entries);
+            for (name_norm, paths) in build_reverse_index_records(forward_records) {
+                let encoded_paths = encode_reverse_paths(&paths);
                 reverse_table
-                    .insert(alias_norm.as_str(), encoded_entries.as_str())
-                    .with_context(|| format!("failed to write reverse index alias {alias_norm}"))?;
+                    .insert(name_norm.as_str(), encoded_paths.as_str())
+                    .with_context(|| format!("failed to write reverse index name {name_norm}"))?;
             }
         }
 
@@ -844,8 +807,7 @@ fn analyze_index_record(
         file_size,
         modified_at,
         extension,
-        faces: collect_face_records(&analysis),
-        aliases: collect_alias_records(&analysis),
+        names: collect_name_records(&analysis),
     }))
 }
 
@@ -860,190 +822,102 @@ fn index_record_matches_file(
         && record.extension.eq_ignore_ascii_case(extension)
 }
 
-fn collect_face_records(analysis: &FontFileAnalysis) -> Vec<FontFaceIndexRecord> {
-    let mut faces = analysis
-        .faces
-        .iter()
-        .map(|face| {
-            let family_norm = face.family_name.as_deref().map(normalize_font_name);
-            FontFaceIndexRecord {
-                face_index: face.face_index,
-                family_name: face.family_name.clone(),
-                family_norm: family_norm.filter(|value| !value.is_empty()),
-                subfamily_name: face.subfamily_name.clone(),
-                full_name: face.full_name.clone(),
-                postscript_name: face.postscript_name.clone(),
-                weight_class: face.weight_class,
-                is_italic: face.is_italic,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    faces.sort_by(|left, right| {
-        left.family_norm
-            .cmp(&right.family_norm)
-            .then_with(|| left.weight_class.cmp(&right.weight_class))
-            .then_with(|| left.is_italic.cmp(&right.is_italic))
-            .then_with(|| left.face_index.cmp(&right.face_index))
-    });
-    faces
-}
-
-fn collect_alias_records(analysis: &FontFileAnalysis) -> Vec<FontAliasRecord> {
+fn collect_name_records(analysis: &FontFileAnalysis) -> Vec<FontNameRecord> {
     let mut seen = HashSet::new();
-    let mut aliases = Vec::new();
+    let mut names = Vec::new();
 
     for face in &analysis.faces {
-        let family_norm = face.family_name.as_deref().map(normalize_font_name);
-        let family_norm = family_norm.filter(|value| !value.is_empty());
-
-        for alias in &face.aliases {
-            let alias_kind = alias_kind(alias.name_id);
-            let platform_id = platform_id_value(&alias.platform_id);
-            let encoding_id = Some(alias.encoding_id);
-            let language_id = Some(alias.language_id);
-
-            for alias_raw in alias_raw_variants(&alias.value) {
-                let alias_norm = normalize_font_name(&alias_raw);
-                if alias_norm.is_empty() {
-                    continue;
-                }
-
-                let key = (
-                    alias_raw.clone(),
-                    alias_norm.clone(),
-                    alias_kind.to_owned(),
-                    face.face_index,
-                    face.weight_class,
-                    face.is_italic,
-                    alias.name_id,
-                    platform_id,
-                    encoding_id,
-                    language_id,
-                );
-                if !seen.insert(key) {
-                    continue;
-                }
-
-                aliases.push(FontAliasRecord {
-                    alias_raw,
-                    alias_norm,
-                    alias_kind: alias_kind.to_owned(),
-                    face_index: face.face_index,
-                    family_name: face.family_name.clone(),
-                    family_norm: family_norm.clone(),
-                    subfamily_name: face.subfamily_name.clone(),
-                    full_name: face.full_name.clone(),
-                    postscript_name: face.postscript_name.clone(),
-                    weight_class: face.weight_class,
-                    is_italic: face.is_italic,
-                    name_id: alias.name_id,
-                    platform_id,
-                    encoding_id,
-                    language_id,
-                    priority: alias_priority(alias.name_id),
-                });
+        for name in &face.name_records {
+            if !is_indexed_name_id(name.name_id) || !is_indexed_platform_id(name.platform_id) {
+                continue;
             }
+
+            let name_norm = normalize_font_name(&name.value);
+            if name_norm.is_empty() {
+                continue;
+            }
+
+            let key = (
+                face.face_index,
+                name.name_id,
+                name.platform_id,
+                name.encoding_id,
+                name.language_id,
+                name_norm.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+
+            names.push(FontNameRecord {
+                face_index: face.face_index,
+                name_id: name.name_id,
+                platform_id: name.platform_id,
+                encoding_id: name.encoding_id,
+                language_id: name.language_id,
+                name: name.value.clone(),
+                name_norm,
+                weight_class: face.weight_class,
+                is_italic: face.is_italic,
+            });
         }
     }
 
-    sort_alias_records(&mut aliases);
-    aliases
-}
-
-fn sort_alias_records(aliases: &mut [FontAliasRecord]) {
-    aliases.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then_with(|| left.alias_kind.cmp(&right.alias_kind))
-            .then_with(|| left.alias_raw.cmp(&right.alias_raw))
-            .then_with(|| left.family_norm.cmp(&right.family_norm))
-            .then_with(|| left.weight_class.cmp(&right.weight_class))
-            .then_with(|| left.is_italic.cmp(&right.is_italic))
-            .then_with(|| left.face_index.cmp(&right.face_index))
+    names.sort_by(|left, right| {
+        left.face_index
+            .cmp(&right.face_index)
             .then_with(|| left.name_id.cmp(&right.name_id))
+            .then_with(|| left.name_norm.cmp(&right.name_norm))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.platform_id.cmp(&right.platform_id))
+            .then_with(|| left.encoding_id.cmp(&right.encoding_id))
+            .then_with(|| left.language_id.cmp(&right.language_id))
     });
+    names
 }
 
 fn build_reverse_index_records(
     forward_records: &BTreeMap<String, FontFileIndexRecord>,
-) -> BTreeMap<String, Vec<ReverseIndexEntry>> {
-    let mut reverse_records =
-        BTreeMap::<String, BTreeMap<ReverseDedupeKey, ReverseIndexEntry>>::new();
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut reverse_records = BTreeMap::<String, BTreeSet<String>>::new();
 
     for (relative_path, record) in forward_records {
-        for alias in &record.aliases {
-            let family_norm = alias
-                .family_norm
-                .clone()
-                .unwrap_or_else(|| alias.alias_norm.clone());
-            let dedupe_key = ReverseDedupeKey {
-                family_norm,
-                weight_class: alias.weight_class,
-                is_italic: alias.is_italic,
-            };
-
-            reverse_records
-                .entry(alias.alias_norm.clone())
-                .or_default()
-                .entry(dedupe_key)
-                .or_insert_with(|| ReverseIndexEntry {
-                    relative_path: relative_path.clone(),
-                    face_index: alias.face_index,
-                });
+        for name in &record.names {
+            if is_reverse_name_id(name.name_id) {
+                reverse_records
+                    .entry(name.name_norm.clone())
+                    .or_default()
+                    .insert(relative_path.clone());
+            }
         }
     }
 
     reverse_records
-        .into_iter()
-        .map(|(alias_norm, entries)| {
-            let mut entries = entries.into_values().collect::<Vec<_>>();
-            entries.sort_by(|left, right| {
-                left.relative_path
-                    .cmp(&right.relative_path)
-                    .then_with(|| left.face_index.cmp(&right.face_index))
-            });
-            (alias_norm, entries)
-        })
-        .collect()
 }
 
-fn encode_reverse_entries(entries: &[ReverseIndexEntry]) -> String {
-    entries
-        .iter()
-        .map(|entry| format!("{}\t{}", entry.relative_path, entry.face_index))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn encode_reverse_paths(paths: &BTreeSet<String>) -> String {
+    paths.iter().cloned().collect::<Vec<_>>().join("\n")
 }
 
-fn decode_reverse_entries(value: &str) -> Vec<ReverseIndexEntry> {
+fn decode_reverse_paths(value: &str) -> Vec<String> {
     value
         .lines()
-        .filter_map(|line| {
-            let (relative_path, face_index) = line
-                .split_once('\t')
-                .map(|(path, face_index)| (path.to_owned(), face_index.parse::<u32>().unwrap_or(0)))
-                .unwrap_or_else(|| (line.to_owned(), 0));
-
-            (!relative_path.is_empty()).then_some(ReverseIndexEntry {
-                relative_path,
-                face_index,
-            })
-        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
         .collect()
 }
 
 fn style_matches(
-    alias: &FontAliasRecord,
+    name: &FontNameRecord,
     weight_class: Option<u16>,
     is_italic: Option<bool>,
 ) -> bool {
-    if is_italic.is_some_and(|requested_italic| alias.is_italic != requested_italic) {
+    if is_italic.is_some_and(|requested_italic| name.is_italic != requested_italic) {
         return false;
     }
 
-    if weight_class.is_some_and(|requested_weight| alias.weight_class != Some(requested_weight)) {
+    if weight_class.is_some_and(|requested_weight| name.weight_class != Some(requested_weight)) {
         return false;
     }
 
@@ -1052,13 +926,16 @@ fn style_matches(
 
 fn sort_font_matches(matches: &mut [FontMatch]) {
     matches.sort_by(|left, right| {
-        left.family_name
-            .cmp(&right.family_name)
+        left.relative_path
+            .cmp(&right.relative_path)
+            .then_with(|| left.face_index.cmp(&right.face_index))
             .then_with(|| left.weight_class.cmp(&right.weight_class))
             .then_with(|| left.is_italic.cmp(&right.is_italic))
-            .then_with(|| left.relative_path.cmp(&right.relative_path))
-            .then_with(|| left.face_index.cmp(&right.face_index))
-            .then_with(|| left.matched_alias.cmp(&right.matched_alias))
+            .then_with(|| left.name_id.cmp(&right.name_id))
+            .then_with(|| left.matched_name.cmp(&right.matched_name))
+            .then_with(|| left.platform_id.cmp(&right.platform_id))
+            .then_with(|| left.encoding_id.cmp(&right.encoding_id))
+            .then_with(|| left.language_id.cmp(&right.language_id))
     });
 }
 
@@ -1079,13 +956,14 @@ fn build_meta_record<'a>(
             _ => {}
         }
 
-        for alias in &record.aliases {
-            meta.total_aliases += 1;
-            match alias.alias_kind.as_str() {
-                "family" => meta.family_alias_count += 1,
-                "full_name" => meta.full_name_alias_count += 1,
-                "postscript_name" => meta.postscript_alias_count += 1,
-                _ => meta.other_alias_count += 1,
+        for name in &record.names {
+            meta.total_names += 1;
+            match name.name_id {
+                1 => meta.family_name_count += 1,
+                2 => meta.subfamily_name_count += 1,
+                4 => meta.full_name_count += 1,
+                6 => meta.postscript_name_count += 1,
+                _ => {}
             }
         }
     }
@@ -1102,59 +980,36 @@ fn build_empty_meta_record(root_path: &Path) -> MetaRecord {
         ttf_count: 0,
         otf_count: 0,
         ttc_count: 0,
-        total_aliases: 0,
-        family_alias_count: 0,
-        full_name_alias_count: 0,
-        postscript_alias_count: 0,
-        other_alias_count: 0,
+        total_names: 0,
+        family_name_count: 0,
+        subfamily_name_count: 0,
+        full_name_count: 0,
+        postscript_name_count: 0,
     }
 }
 
-fn alias_kind(name_id: u16) -> &'static str {
+fn name_kind(name_id: u16) -> &'static str {
     match name_id {
-        name_id::FAMILY | name_id::TYPOGRAPHIC_FAMILY | name_id::WWS_FAMILY => "family",
-        name_id::FULL_NAME => "full_name",
-        name_id::POST_SCRIPT_NAME => "postscript_name",
+        1 => "family_name",
+        2 => "subfamily_name",
+        4 => "full_name",
+        6 => "postscript_name",
+        16 => "typographic_family_name",
+        17 => "typographic_subfamily_name",
         _ => "name",
     }
 }
 
-fn alias_priority(name_id: u16) -> i16 {
-    match name_id {
-        name_id::TYPOGRAPHIC_FAMILY | name_id::WWS_FAMILY => 350,
-        name_id::FAMILY => 300,
-        name_id::FULL_NAME => 200,
-        name_id::POST_SCRIPT_NAME => 100,
-        _ => 0,
-    }
+fn is_indexed_name_id(name_id: u16) -> bool {
+    INDEXED_NAME_IDS.contains(&name_id)
 }
 
-fn platform_id_value(platform_id: &str) -> Option<u16> {
-    match platform_id {
-        "Unicode" => Some(0),
-        "Macintosh" => Some(1),
-        "ISO" => Some(2),
-        "Windows" => Some(3),
-        "Custom" => Some(4),
-        _ => None,
-    }
+fn is_reverse_name_id(name_id: u16) -> bool {
+    REVERSE_NAME_IDS.contains(&name_id)
 }
 
-fn alias_raw_variants(value: &str) -> Vec<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Vec::new();
-    }
-
-    let mut variants = vec![value.to_owned()];
-    if let Some(stripped) = value.strip_prefix('@') {
-        let stripped = stripped.trim_start();
-        if !stripped.is_empty() {
-            variants.push(stripped.to_owned());
-        }
-    }
-
-    variants
+fn is_indexed_platform_id(platform_id: u16) -> bool {
+    matches!(platform_id, 0 | 1 | 3)
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -1234,10 +1089,6 @@ fn optional_u16_text(value: Option<u16>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
-fn optional_string_text(value: Option<String>) -> String {
-    value.unwrap_or_default()
-}
-
 fn unix_timestamp_now() -> i64 {
     system_time_to_unix_timestamp(SystemTime::now())
 }
@@ -1260,112 +1111,130 @@ fn u64_to_usize(value: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        FontAliasRecord, FontFileIndexRecord, build_reverse_index_records, decode_reverse_entries,
-        encode_reverse_entries,
+        FontFileIndexRecord, FontNameRecord, build_reverse_index_records, decode_reverse_paths,
+        encode_reverse_paths,
     };
     use std::collections::BTreeMap;
 
     #[test]
-    fn reverse_index_keeps_multiple_styles_for_same_family_alias() {
+    fn reverse_index_maps_name_to_sorted_deduplicated_paths() {
         let mut records = BTreeMap::new();
         records.insert(
             "Family-Regular.ttf".to_owned(),
-            record("Family", "family", 400, false, 0),
+            record(vec![name("Family", 1, 400, false, 0)]),
         );
         records.insert(
             "Family-Bold.ttf".to_owned(),
-            record("Family", "family", 700, false, 0),
+            record(vec![
+                name("Family", 1, 700, false, 0),
+                name("Family Regular", 4, 400, false, 0),
+            ]),
         );
         records.insert(
             "Family-Italic.ttf".to_owned(),
-            record("Family", "family", 400, true, 0),
+            record(vec![name("Family", 1, 400, true, 0)]),
         );
 
         let reverse = build_reverse_index_records(&records);
-        let entries = reverse.get("family").expect("family alias exists");
+        let paths = reverse.get("family").expect("family name exists");
 
-        assert_eq!(entries.len(), 3);
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.relative_path == "Family-Regular.ttf")
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.relative_path == "Family-Bold.ttf")
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.relative_path == "Family-Italic.ttf")
+        assert_eq!(
+            paths.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "Family-Bold.ttf".to_owned(),
+                "Family-Italic.ttf".to_owned(),
+                "Family-Regular.ttf".to_owned(),
+            ]
         );
     }
 
     #[test]
-    fn reverse_index_deduplicates_same_family_style() {
-        let mut records = BTreeMap::new();
-        records.insert(
-            "Family-Regular-A.ttf".to_owned(),
-            record("Family", "family", 400, false, 0),
-        );
-        records.insert(
-            "Family-Regular-B.ttf".to_owned(),
-            record("Family", "family", 400, false, 0),
-        );
-
-        let reverse = build_reverse_index_records(&records);
-        let entries = reverse.get("family").expect("family alias exists");
-
-        assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
-    fn reverse_entries_round_trip() {
+    fn reverse_index_ignores_subfamily_names() {
         let mut records = BTreeMap::new();
         records.insert(
             "Family-Regular.ttf".to_owned(),
-            record("Family", "family", 400, false, 7),
+            record(vec![name("Regular", 2, 400, false, 0)]),
+        );
+        let reverse = build_reverse_index_records(&records);
+
+        assert!(!reverse.contains_key("regular"));
+    }
+
+    #[test]
+    fn reverse_index_includes_typographic_family_names() {
+        let mut records = BTreeMap::new();
+        records.insert(
+            "Family-Regular.ttf".to_owned(),
+            record(vec![name("Preferred Family", 16, 400, false, 0)]),
+        );
+        let reverse = build_reverse_index_records(&records);
+
+        assert!(reverse.contains_key("preferred family"));
+    }
+
+    #[test]
+    fn reverse_index_ignores_typographic_subfamily_names() {
+        let mut records = BTreeMap::new();
+        records.insert(
+            "Family-Regular.ttf".to_owned(),
+            record(vec![name("Preferred Regular", 17, 400, false, 0)]),
+        );
+        let reverse = build_reverse_index_records(&records);
+
+        assert!(!reverse.contains_key("preferred regular"));
+    }
+
+    #[test]
+    fn typographic_name_ids_have_specific_labels() {
+        assert_eq!(super::name_kind(16), "typographic_family_name");
+        assert_eq!(super::name_kind(17), "typographic_subfamily_name");
+    }
+
+    #[test]
+    fn reverse_paths_round_trip() {
+        let mut records = BTreeMap::new();
+        records.insert(
+            "Family-Regular.ttf".to_owned(),
+            record(vec![
+                name("Family", 1, 400, false, 7),
+                name("Family", 1, 400, false, 8),
+            ]),
         );
 
         let reverse = build_reverse_index_records(&records);
-        let entries = reverse.get("family").expect("family alias exists");
-        let encoded = encode_reverse_entries(entries);
-        let decoded = decode_reverse_entries(&encoded);
+        let paths = reverse.get("family").expect("family name exists");
+        let encoded = encode_reverse_paths(paths);
+        let decoded = decode_reverse_paths(&encoded);
 
-        assert_eq!(decoded, *entries);
+        assert_eq!(decoded, vec!["Family-Regular.ttf".to_owned()]);
     }
 
-    fn record(
-        alias_raw: &str,
-        family_norm: &str,
-        weight_class: u16,
-        is_italic: bool,
-        face_index: u32,
-    ) -> FontFileIndexRecord {
+    fn record(names: Vec<FontNameRecord>) -> FontFileIndexRecord {
         FontFileIndexRecord {
             file_size: 1,
             modified_at: 1,
             extension: "ttf".to_owned(),
-            faces: Vec::new(),
-            aliases: vec![FontAliasRecord {
-                alias_raw: alias_raw.to_owned(),
-                alias_norm: alias_raw.to_lowercase(),
-                alias_kind: "family".to_owned(),
-                face_index,
-                family_name: Some(alias_raw.to_owned()),
-                family_norm: Some(family_norm.to_owned()),
-                subfamily_name: None,
-                full_name: None,
-                postscript_name: None,
-                weight_class: Some(weight_class),
-                is_italic,
-                name_id: 1,
-                platform_id: Some(3),
-                encoding_id: Some(1),
-                language_id: Some(0x0409),
-                priority: 300,
-            }],
+            names,
+        }
+    }
+
+    fn name(
+        value: &str,
+        name_id: u16,
+        weight_class: u16,
+        is_italic: bool,
+        face_index: u32,
+    ) -> FontNameRecord {
+        FontNameRecord {
+            face_index,
+            name_id,
+            platform_id: 3,
+            encoding_id: 1,
+            language_id: 0x0409,
+            name: value.to_owned(),
+            name_norm: value.to_lowercase(),
+            weight_class: Some(weight_class),
+            is_italic,
         }
     }
 }
