@@ -799,11 +799,14 @@ fn alias_raw_variants(value: &str) -> Vec<String> {
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).context("failed to serialize redb font index record")
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .context("failed to serialize redb font index record")
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    serde_json::from_slice(bytes).context("failed to deserialize redb font index record")
+    let (value, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .context("failed to deserialize redb font index record")?;
+    Ok(value)
 }
 
 fn relative_path_text(root: &Path, path: &Path) -> Result<String> {
