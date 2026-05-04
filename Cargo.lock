@@ -608,6 +608,7 @@ dependencies = [
  "encoding_rs",
  "redb",
  "serde",
+ "serde_json",
  "sevenz-rust2",
  "tempfile",
  "toml",
