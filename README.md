@@ -174,3 +174,6 @@ avoid_system_fonts = true
 - `input`: directory/archive preparation
 - `session`: load/unload lifecycle management
 - `subtitle`: ASS/SSA parsing and font usage analysis
+
+## TODO
+- [ ] Keep failed unloads in the session so later unload attempts can retry them.
