@@ -210,7 +210,7 @@ mod tests {
         font::index::{FontMatch, ResolveReport, ResolvedFont},
         session::{FailedFont, LoadSummary, LoadedFont},
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn render_text_uses_compact_sections_and_deduplicated_aliases() {
@@ -317,18 +317,18 @@ mod tests {
         assert!(rendered.contains("  failed to add font resource\n"));
     }
 
-    fn font_match(path: &PathBuf, matched_alias: &str, alias_kind: &str) -> FontMatch {
+    fn font_match(path: &Path, matched_alias: &str, alias_kind: &str) -> FontMatch {
         FontMatch {
             requested_name: matched_alias.to_owned(),
             matched_alias: matched_alias.to_owned(),
             alias_kind: alias_kind.to_owned(),
-            font_path: path.clone(),
+            font_path: path.to_path_buf(),
             relative_path: path.display().to_string(),
             name_id: 0,
             platform_id: None,
             encoding_id: None,
             language_id: None,
-            canonical_path: path.clone(),
+            canonical_path: path.to_path_buf(),
             face_index: 0,
             family_name: None,
             subfamily_name: None,

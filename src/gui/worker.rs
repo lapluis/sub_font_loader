@@ -17,10 +17,6 @@ pub enum GuiTask {
         font_root: PathBuf,
         db_path: PathBuf,
     },
-    RebuildIndex {
-        font_root: PathBuf,
-        db_path: PathBuf,
-    },
     UpdateIndex {
         font_root: PathBuf,
         db_path: PathBuf,
@@ -70,7 +66,6 @@ pub fn run_task(task: GuiTask) -> GuiEvent {
     let is_index_task = matches!(
         task,
         GuiTask::EnsureIndexOnStartup { .. }
-            | GuiTask::RebuildIndex { .. }
             | GuiTask::UpdateIndex { .. }
             | GuiTask::SwitchFontRoot { .. }
     );
@@ -106,11 +101,6 @@ fn run_task_inner(task: GuiTask) -> Result<GuiEvent> {
     match task {
         GuiTask::EnsureIndexOnStartup { font_root, db_path } => {
             let summary = ensure_index_on_startup(&font_root, &db_path)?;
-            Ok(GuiEvent::IndexReady { summary })
-        }
-        GuiTask::RebuildIndex { font_root, db_path } => {
-            let mut index = FontIndex::open(&db_path)?;
-            let summary = index.rebuild_root(&font_root)?;
             Ok(GuiEvent::IndexReady { summary })
         }
         GuiTask::UpdateIndex { font_root, db_path } => {

@@ -48,7 +48,6 @@ struct MainWindow {
     wnd: gui::WindowMain,
     font_root_edit: gui::Edit,
     change_dir_btn: gui::Button,
-    rebuild_btn: gui::Button,
     update_btn: gui::Button,
     load_btn: gui::Button,
     unload_btn: gui::Button,
@@ -88,10 +87,9 @@ impl MainWindow {
             },
         );
         let change_dir_btn = button(&wnd, commands::BTN_CHANGE_FONT_DIR, 585, 10, 160);
-        let rebuild_btn = button(&wnd, commands::BTN_REBUILD_INDEX, 12, 44, 150);
-        let update_btn = button(&wnd, commands::BTN_UPDATE_INDEX, 174, 44, 120);
-        let load_btn = button(&wnd, commands::BTN_LOAD_SUBTITLES, 306, 44, 120);
-        let unload_btn = button(&wnd, commands::BTN_UNLOAD_FONTS, 438, 44, 110);
+        let update_btn = button(&wnd, commands::BTN_UPDATE_INDEX, 12, 44, 120);
+        let load_btn = button(&wnd, commands::BTN_LOAD_SUBTITLES, 144, 44, 120);
+        let unload_btn = button(&wnd, commands::BTN_UNLOAD_FONTS, 276, 44, 110);
         let result_edit = gui::Edit::new(
             &wnd,
             gui::EditOpts {
@@ -138,7 +136,6 @@ impl MainWindow {
             wnd,
             font_root_edit,
             change_dir_btn,
-            rebuild_btn,
             update_btn,
             load_btn,
             unload_btn,
@@ -164,18 +161,6 @@ impl MainWindow {
             if let Some(folder) = app.choose_folder("Choose Font Directory")? {
                 app.change_font_root(Arc::clone(&state_for_change), folder)?;
             }
-            Ok(())
-        });
-
-        let app = self.clone();
-        let state_for_rebuild = Arc::clone(&state);
-        self.rebuild_btn.on().bn_clicked(move || {
-            app.start_index_task(
-                Arc::clone(&state_for_rebuild),
-                IndexStatus::Building,
-                make_rebuild_task(&state_for_rebuild),
-                None,
-            );
             Ok(())
         });
 
@@ -286,7 +271,7 @@ impl MainWindow {
             let _ = self.set_report_text("");
 
             GuiTask::SwitchFontRoot {
-                old_session: state.font_session.take().unwrap_or_else(FontSession::new),
+                old_session: state.font_session.take().unwrap_or_default(),
                 font_root: new_root,
                 db_path: state.db_path.clone(),
             }
@@ -343,7 +328,7 @@ impl MainWindow {
                 inputs,
                 db_path: state.db_path.clone(),
                 avoid_system_fonts: state.config.avoid_system_fonts,
-                current_session: state.font_session.take().unwrap_or_else(FontSession::new),
+                current_session: state.font_session.take().unwrap_or_default(),
             }
         };
 
@@ -362,7 +347,7 @@ impl MainWindow {
             self.update_ui(&state);
 
             GuiTask::UnloadFonts {
-                session: state.font_session.take().unwrap_or_else(FontSession::new),
+                session: state.font_session.take().unwrap_or_default(),
             }
         };
 
@@ -380,7 +365,7 @@ impl MainWindow {
 
         thread::spawn(move || {
             let event = worker::run_task(task);
-            let _ = dispatcher.run_ui_thread(move || {
+            dispatcher.run_ui_thread(move || {
                 app.apply_event(Arc::clone(&state), event, startup_inputs)?;
                 Ok(())
             });
@@ -404,10 +389,11 @@ impl MainWindow {
                     state.index_status = IndexStatus::from_summary(&summary);
                     state.load_status = LoadStatus::Idle;
 
-                    if let Some(inputs) = startup_inputs {
-                        if state.config.auto_load_startup_subtitles && !inputs.is_empty() {
-                            auto_load = Some(inputs);
-                        }
+                    if let Some(inputs) = startup_inputs
+                        && state.config.auto_load_startup_subtitles
+                        && !inputs.is_empty()
+                    {
+                        auto_load = Some(inputs);
                     }
                 }
                 GuiEvent::IndexFailed { error } => {
@@ -488,7 +474,6 @@ impl MainWindow {
 
         let idle = !state.is_busy;
         self.change_dir_btn.hwnd().EnableWindow(idle);
-        self.rebuild_btn.hwnd().EnableWindow(idle);
         self.update_btn.hwnd().EnableWindow(idle);
         self.load_btn
             .hwnd()
@@ -631,14 +616,6 @@ fn create_open_dialog() -> w::AnyResult<w::IFileOpenDialog> {
 fn make_startup_index_task(state: &Arc<Mutex<AppState>>) -> GuiTask {
     let state = state.lock().unwrap();
     GuiTask::EnsureIndexOnStartup {
-        font_root: state.font_root.clone(),
-        db_path: state.db_path.clone(),
-    }
-}
-
-fn make_rebuild_task(state: &Arc<Mutex<AppState>>) -> GuiTask {
-    let state = state.lock().unwrap();
-    GuiTask::RebuildIndex {
         font_root: state.font_root.clone(),
         db_path: state.db_path.clone(),
     }

@@ -125,7 +125,7 @@ Export indexed aliases:
 cargo run --bin font_index -- export-csv --db font_index.redb aliases.csv
 ```
 
-The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Re-scans skip unchanged files and mark previously indexed files unavailable when they disappear from the scan root.
+The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Index updates compare file path, size, and modification time, skip unchanged files, remove files that disappeared from the scan root, and analyze only new or modified font files. Family aliases retain one candidate per style attribute so Regular/Bold/Italic variants can be loaded together.
 
 ### `sub_font_loader_gui`
 
@@ -135,7 +135,7 @@ Open the native Windows GUI:
 cargo run --bin sub_font_loader_gui
 ```
 
-The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose aliases are already available from system-installed fonts.
+The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose aliases are already available from system-installed fonts. Switching the font directory rebuilds the index for the new root; the Update Index button performs incremental updates for the current root.
 
 ```toml
 font_root = ""

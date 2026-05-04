@@ -10,6 +10,8 @@ use ttf_parser::{Face, PlatformId, name::Name, name_id};
 
 const ALIAS_NAME_IDS: &[u16] = &[
     name_id::FAMILY,
+    name_id::TYPOGRAPHIC_FAMILY,
+    name_id::WWS_FAMILY,
     name_id::FULL_NAME,
     name_id::POST_SCRIPT_NAME,
 ];
@@ -26,6 +28,12 @@ pub struct FontAlias {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontFaceAnalysis {
     pub face_index: u32,
+    pub family_name: Option<String>,
+    pub subfamily_name: Option<String>,
+    pub full_name: Option<String>,
+    pub postscript_name: Option<String>,
+    pub weight_class: Option<u16>,
+    pub is_italic: bool,
     pub aliases: Vec<FontAlias>,
 }
 
@@ -64,19 +72,18 @@ pub fn analyze_font_files(paths: &[PathBuf]) -> Result<Vec<FontFileAnalysis>> {
 }
 
 fn decode_name_record(name: &Name<'_>) -> Option<String> {
-    if name.platform_id == PlatformId::Windows {
-        if let Some(value) = decode_utf16be_name(name.name) {
-            if is_usable_name(&value) {
-                return Some(value);
-            }
-        }
+    if name.platform_id == PlatformId::Windows
+        && let Some(value) = decode_utf16be_name(name.name)
+        && is_usable_name(&value)
+    {
+        return Some(value);
     }
 
     name.to_string().filter(|value| is_usable_name(value))
 }
 
 fn decode_utf16be_name(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() || bytes.len() % 2 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return None;
     }
 
@@ -103,16 +110,36 @@ fn is_usable_name(value: &str) -> bool {
 fn analyze_face(face_index: u32, face: &Face<'_>) -> FontFaceAnalysis {
     let mut seen = HashSet::new();
     let mut aliases = Vec::new();
+    let mut family_name = None;
+    let mut subfamily_name = None;
+    let mut full_name = None;
+    let mut postscript_name = None;
 
     for name in face.names() {
-        if !ALIAS_NAME_IDS.contains(&name.name_id) {
-            continue;
-        }
-
         let Some(value) = decode_name_record(&name).and_then(|value| normalize_alias(&value))
         else {
             continue;
         };
+
+        match name.name_id {
+            name_id::FAMILY | name_id::TYPOGRAPHIC_FAMILY | name_id::WWS_FAMILY => {
+                prefer_name(&mut family_name, &name, &value);
+            }
+            name_id::SUBFAMILY | name_id::TYPOGRAPHIC_SUBFAMILY | name_id::WWS_SUBFAMILY => {
+                prefer_name(&mut subfamily_name, &name, &value);
+            }
+            name_id::FULL_NAME => {
+                prefer_name(&mut full_name, &name, &value);
+            }
+            name_id::POST_SCRIPT_NAME => {
+                prefer_name(&mut postscript_name, &name, &value);
+            }
+            _ => {}
+        }
+
+        if !ALIAS_NAME_IDS.contains(&name.name_id) {
+            continue;
+        }
 
         let alias_key = value.to_lowercase();
         if !seen.insert((name.name_id, alias_key)) {
@@ -130,8 +157,43 @@ fn analyze_face(face_index: u32, face: &Face<'_>) -> FontFaceAnalysis {
 
     FontFaceAnalysis {
         face_index,
+        family_name: family_name.map(|(_, value)| value),
+        subfamily_name: subfamily_name.map(|(_, value)| value),
+        full_name: full_name.map(|(_, value)| value),
+        postscript_name: postscript_name.map(|(_, value)| value),
+        weight_class: Some(face.weight().to_number()),
+        is_italic: face.is_italic() || face.is_oblique(),
         aliases,
     }
+}
+
+fn prefer_name(target: &mut Option<(u8, String)>, name: &Name<'_>, value: &str) {
+    let priority = name_priority(name);
+    if target
+        .as_ref()
+        .is_none_or(|(current_priority, _)| priority > *current_priority)
+    {
+        *target = Some((priority, value.to_owned()));
+    }
+}
+
+fn name_priority(name: &Name<'_>) -> u8 {
+    let platform_priority = match (name.platform_id, name.language_id) {
+        (PlatformId::Windows, 0x0409) => 5,
+        (PlatformId::Windows, _) => 4,
+        (PlatformId::Unicode, _) => 3,
+        (PlatformId::Macintosh, 0) => 2,
+        (PlatformId::Macintosh, _) => 1,
+        _ => 0,
+    };
+    let name_priority = match name.name_id {
+        name_id::TYPOGRAPHIC_FAMILY | name_id::TYPOGRAPHIC_SUBFAMILY => 3,
+        name_id::WWS_FAMILY | name_id::WWS_SUBFAMILY => 2,
+        name_id::FAMILY | name_id::SUBFAMILY => 1,
+        _ => 0,
+    };
+
+    platform_priority * 10 + name_priority
 }
 
 fn platform_id_name(platform_id: PlatformId) -> &'static str {

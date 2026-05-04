@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -17,7 +17,7 @@ use crate::discover;
 
 use super::{FontFileAnalysis, analyze_font_file};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const META_KEY: &str = "state";
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -60,7 +60,20 @@ pub struct FontFileIndexRecord {
     /// Lowercase extension without dot, for example "ttf", "otf", or "ttc".
     pub extension: String,
 
+    pub faces: Vec<FontFaceIndexRecord>,
     pub aliases: Vec<FontAliasRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FontFaceIndexRecord {
+    pub face_index: u32,
+    pub family_name: Option<String>,
+    pub family_norm: Option<String>,
+    pub subfamily_name: Option<String>,
+    pub full_name: Option<String>,
+    pub postscript_name: Option<String>,
+    pub weight_class: Option<u16>,
+    pub is_italic: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +81,15 @@ pub struct FontAliasRecord {
     pub alias_raw: String,
     pub alias_norm: String,
     pub alias_kind: String,
+
+    pub face_index: u32,
+    pub family_name: Option<String>,
+    pub family_norm: Option<String>,
+    pub subfamily_name: Option<String>,
+    pub full_name: Option<String>,
+    pub postscript_name: Option<String>,
+    pub weight_class: Option<u16>,
+    pub is_italic: bool,
 
     pub name_id: u16,
 
@@ -131,6 +153,19 @@ struct DiscoveredFontPath {
     relative_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReverseIndexEntry {
+    relative_path: String,
+    face_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReverseDedupeKey {
+    family_norm: String,
+    weight_class: Option<u16>,
+    is_italic: bool,
+}
+
 impl FontIndex {
     pub fn open(db_path: &Path) -> Result<Self> {
         let db = Database::create(db_path)
@@ -147,58 +182,18 @@ impl FontIndex {
             ..ScanSummary::default()
         };
 
-        self.clear_index_data()?;
-
         let font_paths = discover_font_paths(&root_path, &mut summary)?;
         summary.scanned_files = font_paths.len();
 
-        let mut forward_records = Vec::new();
+        let mut forward_records = BTreeMap::new();
         for font_path in font_paths {
-            let metadata = match fs::metadata(&font_path.path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    summary.failed_files += 1;
-                    eprintln!(
-                        "Warning: failed to read metadata for {}: {error}",
-                        font_path.path.display()
-                    );
-                    continue;
-                }
-            };
-
-            let mut record = FontFileIndexRecord {
-                file_size: metadata.len(),
-                modified_at: metadata
-                    .modified()
-                    .map(system_time_to_unix_timestamp)
-                    .unwrap_or(0),
-                extension: font_path
-                    .path
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase(),
-                aliases: Vec::new(),
-            };
-
-            match analyze_font_file(&font_path.path) {
-                Ok(analysis) => {
-                    record.aliases = collect_alias_records(&analysis);
-                    summary.indexed_files += 1;
-                }
-                Err(error) => {
-                    summary.failed_files += 1;
-                    eprintln!(
-                        "Warning: failed to analyze {}: {error:#}",
-                        font_path.path.display()
-                    );
-                }
+            if let Some(record) = analyze_index_record(&font_path.path, &mut summary)? {
+                summary.indexed_files += 1;
+                forward_records.insert(font_path.relative_path, record);
             }
-
-            forward_records.push((font_path.relative_path, record));
         }
 
-        let meta = build_meta_record(&root_path, unix_timestamp_now(), &forward_records);
+        let meta = build_meta_record(&root_path, unix_timestamp_now(), forward_records.iter());
         self.write_rebuilt_index(&meta, &forward_records)?;
         Ok(summary)
     }
@@ -210,8 +205,76 @@ impl FontIndex {
     }
 
     pub fn update_bound_root(&mut self, root: &Path) -> Result<ScanSummary> {
-        let summary = self.scan_root(root)?;
-        self.set_active_font_root(&summary.root)?;
+        let root_path = canonicalize_font_root(root)?;
+        let Some(meta) = self.read_meta_record()? else {
+            return self.rebuild_root(&root_path);
+        };
+
+        if meta.schema_version != SCHEMA_VERSION
+            || !paths_equal_text(&meta.root_path, &path_to_db_text(&root_path))
+        {
+            return self.rebuild_root(&root_path);
+        }
+
+        let mut summary = ScanSummary {
+            root: root_path.clone(),
+            ..ScanSummary::default()
+        };
+        let font_paths = discover_font_paths(&root_path, &mut summary)?;
+        summary.scanned_files = font_paths.len();
+
+        let mut existing_records = self.read_forward_records()?;
+        let mut next_records = BTreeMap::new();
+
+        for font_path in font_paths {
+            let metadata = match fs::metadata(&font_path.path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    summary.failed_files += 1;
+                    eprintln!(
+                        "Warning: failed to read metadata for {}: {error}",
+                        font_path.path.display()
+                    );
+
+                    if let Some(existing) = existing_records.remove(&font_path.relative_path) {
+                        summary.indexed_files += 1;
+                        next_records.insert(font_path.relative_path, existing);
+                    }
+                    continue;
+                }
+            };
+
+            let file_size = metadata.len();
+            let modified_at = metadata
+                .modified()
+                .map(system_time_to_unix_timestamp)
+                .unwrap_or(0);
+            let extension = font_path
+                .path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if let Some(existing) = existing_records.remove(&font_path.relative_path)
+                && index_record_matches_file(&existing, file_size, modified_at, &extension)
+            {
+                summary.skipped_unchanged_files += 1;
+                summary.indexed_files += 1;
+                next_records.insert(font_path.relative_path, existing);
+                continue;
+            }
+
+            if let Some(record) = analyze_index_record(&font_path.path, &mut summary)? {
+                summary.indexed_files += 1;
+                next_records.insert(font_path.relative_path, record);
+            }
+        }
+
+        summary.unavailable_files = existing_records.len();
+
+        let meta = build_meta_record(&root_path, unix_timestamp_now(), next_records.iter());
+        self.write_rebuilt_index(&meta, &next_records)?;
         Ok(summary)
     }
 
@@ -290,16 +353,39 @@ impl FontIndex {
             });
         }
 
+        if meta.schema_version != SCHEMA_VERSION {
+            return Ok(ScanSummary {
+                root: root_path,
+                ..ScanSummary::default()
+            });
+        }
+
         let total_font_files = u64_to_usize(meta.total_font_files);
-        Ok(ScanSummary {
-            root: root_path,
-            scanned_files: total_font_files,
+        let mut summary = ScanSummary {
+            root: root_path.clone(),
             indexed_files: total_font_files,
             ..ScanSummary::default()
-        })
+        };
+        let font_paths = discover_font_paths(&root_path, &mut summary)?;
+        summary.scanned_files = font_paths.len();
+
+        if summary.indexed_files > summary.scanned_files {
+            summary.unavailable_files = summary.indexed_files - summary.scanned_files;
+        }
+
+        Ok(summary)
     }
 
     pub fn query_alias(&self, font_name: &str) -> Result<Vec<FontMatch>> {
+        self.query_alias_with_style(font_name, None, None)
+    }
+
+    pub fn query_alias_with_style(
+        &self,
+        font_name: &str,
+        weight_class: Option<u16>,
+        is_italic: Option<bool>,
+    ) -> Result<Vec<FontMatch>> {
         let alias_norm = normalize_font_name(font_name);
         if alias_norm.is_empty() {
             return Ok(Vec::new());
@@ -310,63 +396,86 @@ impl FontIndex {
             .begin_read()
             .context("failed to start redb font index read transaction")?;
 
+        let meta =
+            read_meta_record_from_txn(&read_txn)?.context("redb font index metadata is missing")?;
+        if meta.schema_version != SCHEMA_VERSION {
+            bail!("redb font index schema is outdated; update the font index first");
+        }
+
         let reverse_table = read_txn
             .open_table(REVERSE_INDEX_TABLE)
             .context("failed to open redb font index reverse table")?;
-        let Some(relative_path) = reverse_table
+        let Some(reverse_entries) = reverse_table
             .get(alias_norm.as_str())
             .context("failed to read redb font index reverse table")?
-            .map(|value| value.value().to_owned())
+            .map(|value| decode_reverse_entries(value.value()))
         else {
             return Ok(Vec::new());
         };
         drop(reverse_table);
 
-        let meta =
-            read_meta_record_from_txn(&read_txn)?.context("redb font index metadata is missing")?;
-
         let forward_table = read_txn
             .open_table(FORWARD_INDEX_TABLE)
             .context("failed to open redb font index forward table")?;
-        let record = forward_table
-            .get(relative_path.as_str())
-            .context("failed to read redb font index forward table")?
-            .map(|value| decode::<FontFileIndexRecord>(value.value()))
-            .transpose()?
-            .with_context(|| {
-                format!("reverse index points to missing font record {relative_path}")
-            })?;
+        let mut matches = Vec::new();
+        let mut seen_matches = HashSet::new();
 
-        let Some(alias) = record
-            .aliases
-            .iter()
-            .find(|alias| alias.alias_norm == alias_norm)
-        else {
-            return Ok(Vec::new());
-        };
+        for reverse_entry in reverse_entries {
+            let record = forward_table
+                .get(reverse_entry.relative_path.as_str())
+                .context("failed to read redb font index forward table")?
+                .map(|value| decode::<FontFileIndexRecord>(value.value()))
+                .transpose()?
+                .with_context(|| {
+                    format!(
+                        "reverse index points to missing font record {}",
+                        reverse_entry.relative_path
+                    )
+                })?;
 
-        let font_path =
-            PathBuf::from(&meta.root_path).join(relative_path_to_path_buf(&relative_path));
+            for alias in record.aliases.iter().filter(|alias| {
+                alias.alias_norm == alias_norm && alias.face_index == reverse_entry.face_index
+            }) {
+                if !style_matches(alias, weight_class, is_italic) {
+                    continue;
+                }
 
-        Ok(vec![FontMatch {
-            requested_name: font_name.to_owned(),
-            matched_alias: alias.alias_raw.clone(),
-            alias_kind: alias.alias_kind.clone(),
-            font_path: font_path.clone(),
-            relative_path,
-            name_id: alias.name_id,
-            platform_id: alias.platform_id,
-            encoding_id: alias.encoding_id,
-            language_id: alias.language_id,
-            canonical_path: font_path,
-            face_index: 0,
-            family_name: None,
-            subfamily_name: None,
-            full_name: None,
-            postscript_name: None,
-            weight_class: None,
-            is_italic: false,
-        }])
+                let match_key = (
+                    reverse_entry.relative_path.clone(),
+                    alias.face_index,
+                    alias.alias_norm.clone(),
+                );
+                if !seen_matches.insert(match_key) {
+                    continue;
+                }
+
+                let font_path = PathBuf::from(&meta.root_path)
+                    .join(relative_path_to_path_buf(&reverse_entry.relative_path));
+
+                matches.push(FontMatch {
+                    requested_name: font_name.to_owned(),
+                    matched_alias: alias.alias_raw.clone(),
+                    alias_kind: alias.alias_kind.clone(),
+                    font_path: font_path.clone(),
+                    relative_path: reverse_entry.relative_path.clone(),
+                    name_id: alias.name_id,
+                    platform_id: alias.platform_id,
+                    encoding_id: alias.encoding_id,
+                    language_id: alias.language_id,
+                    canonical_path: font_path,
+                    face_index: alias.face_index,
+                    family_name: alias.family_name.clone(),
+                    subfamily_name: alias.subfamily_name.clone(),
+                    full_name: alias.full_name.clone(),
+                    postscript_name: alias.postscript_name.clone(),
+                    weight_class: alias.weight_class,
+                    is_italic: alias.is_italic,
+                });
+            }
+        }
+
+        sort_font_matches(&mut matches);
+        Ok(matches)
     }
 
     pub fn resolve_required_fonts<I, S>(&self, required_names: I) -> Result<ResolveReport>
@@ -417,6 +526,14 @@ impl FontIndex {
                 "alias_raw",
                 "alias_norm",
                 "alias_kind",
+                "face_index",
+                "family_name",
+                "family_norm",
+                "subfamily_name",
+                "full_name",
+                "postscript_name",
+                "weight_class",
+                "is_italic",
                 "name_id",
                 "platform_id",
                 "encoding_id",
@@ -429,6 +546,12 @@ impl FontIndex {
             .db
             .begin_read()
             .context("failed to start redb font index read transaction")?;
+        let meta =
+            read_meta_record_from_txn(&read_txn)?.context("redb font index metadata is missing")?;
+        if meta.schema_version != SCHEMA_VERSION {
+            bail!("redb font index schema is outdated; update the font index first");
+        }
+
         let forward_table = read_txn
             .open_table(FORWARD_INDEX_TABLE)
             .context("failed to open redb font index forward table")?;
@@ -452,6 +575,14 @@ impl FontIndex {
                         alias.alias_raw,
                         alias.alias_norm,
                         alias.alias_kind,
+                        alias.face_index.to_string(),
+                        optional_string_text(alias.family_name),
+                        optional_string_text(alias.family_norm),
+                        optional_string_text(alias.subfamily_name),
+                        optional_string_text(alias.full_name),
+                        optional_string_text(alias.postscript_name),
+                        optional_u16_text(alias.weight_class),
+                        alias.is_italic.to_string(),
                         alias.name_id.to_string(),
                         optional_u16_text(alias.platform_id),
                         optional_u16_text(alias.encoding_id),
@@ -498,12 +629,22 @@ impl FontIndex {
     fn write_rebuilt_index(
         &self,
         meta: &MetaRecord,
-        forward_records: &[(String, FontFileIndexRecord)],
+        forward_records: &BTreeMap<String, FontFileIndexRecord>,
     ) -> Result<()> {
         let write_txn = self
             .db
             .begin_write()
             .context("failed to start redb font index write transaction")?;
+
+        write_txn
+            .delete_table(META_TABLE)
+            .context("failed to delete redb font index meta table")?;
+        write_txn
+            .delete_table(FORWARD_INDEX_TABLE)
+            .context("failed to delete redb font index forward table")?;
+        write_txn
+            .delete_table(REVERSE_INDEX_TABLE)
+            .context("failed to delete redb font index reverse table")?;
 
         {
             let mut forward_table = write_txn
@@ -524,18 +665,12 @@ impl FontIndex {
             let mut reverse_table = write_txn
                 .open_table(REVERSE_INDEX_TABLE)
                 .context("failed to open redb font index reverse table")?;
-            let mut seen_alias_norms = HashSet::new();
 
-            for (relative_path, record) in forward_records {
-                for alias in &record.aliases {
-                    if seen_alias_norms.insert(alias.alias_norm.clone()) {
-                        reverse_table
-                            .insert(alias.alias_norm.as_str(), relative_path.as_str())
-                            .with_context(|| {
-                                format!("failed to write reverse index alias {}", alias.alias_norm)
-                            })?;
-                    }
-                }
+            for (alias_norm, entries) in build_reverse_index_records(forward_records) {
+                let encoded_entries = encode_reverse_entries(&entries);
+                reverse_table
+                    .insert(alias_norm.as_str(), encoded_entries.as_str())
+                    .with_context(|| format!("failed to write reverse index alias {alias_norm}"))?;
             }
         }
 
@@ -552,6 +687,30 @@ impl FontIndex {
         write_txn
             .commit()
             .context("failed to commit redb font index write transaction")
+    }
+
+    fn read_forward_records(&self) -> Result<BTreeMap<String, FontFileIndexRecord>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("failed to start redb font index read transaction")?;
+        let forward_table = read_txn
+            .open_table(FORWARD_INDEX_TABLE)
+            .context("failed to open redb font index forward table")?;
+        let mut records = BTreeMap::new();
+
+        for entry in forward_table
+            .iter()
+            .context("failed to iterate redb font index forward table")?
+        {
+            let (key, value) = entry.context("failed to read redb font index forward row")?;
+            let relative_path = key.value().to_owned();
+            let record = decode::<FontFileIndexRecord>(value.value())
+                .with_context(|| format!("failed to decode font index record {relative_path}"))?;
+            records.insert(relative_path, record);
+        }
+
+        Ok(records)
     }
 }
 
@@ -645,11 +804,99 @@ fn discover_font_paths(root: &Path, summary: &mut ScanSummary) -> Result<Vec<Dis
     Ok(font_paths)
 }
 
+fn analyze_index_record(
+    path: &Path,
+    summary: &mut ScanSummary,
+) -> Result<Option<FontFileIndexRecord>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            summary.failed_files += 1;
+            eprintln!(
+                "Warning: failed to read metadata for {}: {error}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+
+    let file_size = metadata.len();
+    let modified_at = metadata
+        .modified()
+        .map(system_time_to_unix_timestamp)
+        .unwrap_or(0);
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let analysis = match analyze_font_file(path) {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            summary.failed_files += 1;
+            eprintln!("Warning: failed to analyze {}: {error:#}", path.display());
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(FontFileIndexRecord {
+        file_size,
+        modified_at,
+        extension,
+        faces: collect_face_records(&analysis),
+        aliases: collect_alias_records(&analysis),
+    }))
+}
+
+fn index_record_matches_file(
+    record: &FontFileIndexRecord,
+    file_size: u64,
+    modified_at: i64,
+    extension: &str,
+) -> bool {
+    record.file_size == file_size
+        && record.modified_at == modified_at
+        && record.extension.eq_ignore_ascii_case(extension)
+}
+
+fn collect_face_records(analysis: &FontFileAnalysis) -> Vec<FontFaceIndexRecord> {
+    let mut faces = analysis
+        .faces
+        .iter()
+        .map(|face| {
+            let family_norm = face.family_name.as_deref().map(normalize_font_name);
+            FontFaceIndexRecord {
+                face_index: face.face_index,
+                family_name: face.family_name.clone(),
+                family_norm: family_norm.filter(|value| !value.is_empty()),
+                subfamily_name: face.subfamily_name.clone(),
+                full_name: face.full_name.clone(),
+                postscript_name: face.postscript_name.clone(),
+                weight_class: face.weight_class,
+                is_italic: face.is_italic,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    faces.sort_by(|left, right| {
+        left.family_norm
+            .cmp(&right.family_norm)
+            .then_with(|| left.weight_class.cmp(&right.weight_class))
+            .then_with(|| left.is_italic.cmp(&right.is_italic))
+            .then_with(|| left.face_index.cmp(&right.face_index))
+    });
+    faces
+}
+
 fn collect_alias_records(analysis: &FontFileAnalysis) -> Vec<FontAliasRecord> {
     let mut seen = HashSet::new();
     let mut aliases = Vec::new();
 
     for face in &analysis.faces {
+        let family_norm = face.family_name.as_deref().map(normalize_font_name);
+        let family_norm = family_norm.filter(|value| !value.is_empty());
+
         for alias in &face.aliases {
             let alias_kind = alias_kind(alias.name_id);
             let platform_id = platform_id_value(&alias.platform_id);
@@ -666,6 +913,9 @@ fn collect_alias_records(analysis: &FontFileAnalysis) -> Vec<FontAliasRecord> {
                     alias_raw.clone(),
                     alias_norm.clone(),
                     alias_kind.to_owned(),
+                    face.face_index,
+                    face.weight_class,
+                    face.is_italic,
                     alias.name_id,
                     platform_id,
                     encoding_id,
@@ -679,6 +929,14 @@ fn collect_alias_records(analysis: &FontFileAnalysis) -> Vec<FontAliasRecord> {
                     alias_raw,
                     alias_norm,
                     alias_kind: alias_kind.to_owned(),
+                    face_index: face.face_index,
+                    family_name: face.family_name.clone(),
+                    family_norm: family_norm.clone(),
+                    subfamily_name: face.subfamily_name.clone(),
+                    full_name: face.full_name.clone(),
+                    postscript_name: face.postscript_name.clone(),
+                    weight_class: face.weight_class,
+                    is_italic: face.is_italic,
                     name_id: alias.name_id,
                     platform_id,
                     encoding_id,
@@ -700,14 +958,114 @@ fn sort_alias_records(aliases: &mut [FontAliasRecord]) {
             .cmp(&left.priority)
             .then_with(|| left.alias_kind.cmp(&right.alias_kind))
             .then_with(|| left.alias_raw.cmp(&right.alias_raw))
+            .then_with(|| left.family_norm.cmp(&right.family_norm))
+            .then_with(|| left.weight_class.cmp(&right.weight_class))
+            .then_with(|| left.is_italic.cmp(&right.is_italic))
+            .then_with(|| left.face_index.cmp(&right.face_index))
             .then_with(|| left.name_id.cmp(&right.name_id))
     });
 }
 
-fn build_meta_record(
+fn build_reverse_index_records(
+    forward_records: &BTreeMap<String, FontFileIndexRecord>,
+) -> BTreeMap<String, Vec<ReverseIndexEntry>> {
+    let mut reverse_records =
+        BTreeMap::<String, BTreeMap<ReverseDedupeKey, ReverseIndexEntry>>::new();
+
+    for (relative_path, record) in forward_records {
+        for alias in &record.aliases {
+            let family_norm = alias
+                .family_norm
+                .clone()
+                .unwrap_or_else(|| alias.alias_norm.clone());
+            let dedupe_key = ReverseDedupeKey {
+                family_norm,
+                weight_class: alias.weight_class,
+                is_italic: alias.is_italic,
+            };
+
+            reverse_records
+                .entry(alias.alias_norm.clone())
+                .or_default()
+                .entry(dedupe_key)
+                .or_insert_with(|| ReverseIndexEntry {
+                    relative_path: relative_path.clone(),
+                    face_index: alias.face_index,
+                });
+        }
+    }
+
+    reverse_records
+        .into_iter()
+        .map(|(alias_norm, entries)| {
+            let mut entries = entries.into_values().collect::<Vec<_>>();
+            entries.sort_by(|left, right| {
+                left.relative_path
+                    .cmp(&right.relative_path)
+                    .then_with(|| left.face_index.cmp(&right.face_index))
+            });
+            (alias_norm, entries)
+        })
+        .collect()
+}
+
+fn encode_reverse_entries(entries: &[ReverseIndexEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("{}\t{}", entry.relative_path, entry.face_index))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_reverse_entries(value: &str) -> Vec<ReverseIndexEntry> {
+    value
+        .lines()
+        .filter_map(|line| {
+            let (relative_path, face_index) = line
+                .split_once('\t')
+                .map(|(path, face_index)| (path.to_owned(), face_index.parse::<u32>().unwrap_or(0)))
+                .unwrap_or_else(|| (line.to_owned(), 0));
+
+            (!relative_path.is_empty()).then_some(ReverseIndexEntry {
+                relative_path,
+                face_index,
+            })
+        })
+        .collect()
+}
+
+fn style_matches(
+    alias: &FontAliasRecord,
+    weight_class: Option<u16>,
+    is_italic: Option<bool>,
+) -> bool {
+    if is_italic.is_some_and(|requested_italic| alias.is_italic != requested_italic) {
+        return false;
+    }
+
+    if weight_class.is_some_and(|requested_weight| alias.weight_class != Some(requested_weight)) {
+        return false;
+    }
+
+    true
+}
+
+fn sort_font_matches(matches: &mut [FontMatch]) {
+    matches.sort_by(|left, right| {
+        left.family_name
+            .cmp(&right.family_name)
+            .then_with(|| left.weight_class.cmp(&right.weight_class))
+            .then_with(|| left.is_italic.cmp(&right.is_italic))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+            .then_with(|| left.face_index.cmp(&right.face_index))
+            .then_with(|| left.matched_alias.cmp(&right.matched_alias))
+    });
+}
+
+fn build_meta_record<'a>(
     root_path: &Path,
     scanned_at: i64,
-    forward_records: &[(String, FontFileIndexRecord)],
+    forward_records: impl IntoIterator<Item = (&'a String, &'a FontFileIndexRecord)>,
 ) -> MetaRecord {
     let mut meta = build_empty_meta_record(root_path);
     meta.scanned_at = scanned_at;
@@ -754,7 +1112,7 @@ fn build_empty_meta_record(root_path: &Path) -> MetaRecord {
 
 fn alias_kind(name_id: u16) -> &'static str {
     match name_id {
-        name_id::FAMILY => "family",
+        name_id::FAMILY | name_id::TYPOGRAPHIC_FAMILY | name_id::WWS_FAMILY => "family",
         name_id::FULL_NAME => "full_name",
         name_id::POST_SCRIPT_NAME => "postscript_name",
         _ => "name",
@@ -763,6 +1121,7 @@ fn alias_kind(name_id: u16) -> &'static str {
 
 fn alias_priority(name_id: u16) -> i16 {
     match name_id {
+        name_id::TYPOGRAPHIC_FAMILY | name_id::WWS_FAMILY => 350,
         name_id::FAMILY => 300,
         name_id::FULL_NAME => 200,
         name_id::POST_SCRIPT_NAME => 100,
@@ -875,6 +1234,10 @@ fn optional_u16_text(value: Option<u16>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
+fn optional_string_text(value: Option<String>) -> String {
+    value.unwrap_or_default()
+}
+
 fn unix_timestamp_now() -> i64 {
     system_time_to_unix_timestamp(SystemTime::now())
 }
@@ -892,4 +1255,117 @@ fn u64_to_i64(value: u64) -> i64 {
 
 fn u64_to_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FontAliasRecord, FontFileIndexRecord, build_reverse_index_records, decode_reverse_entries,
+        encode_reverse_entries,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn reverse_index_keeps_multiple_styles_for_same_family_alias() {
+        let mut records = BTreeMap::new();
+        records.insert(
+            "Family-Regular.ttf".to_owned(),
+            record("Family", "family", 400, false, 0),
+        );
+        records.insert(
+            "Family-Bold.ttf".to_owned(),
+            record("Family", "family", 700, false, 0),
+        );
+        records.insert(
+            "Family-Italic.ttf".to_owned(),
+            record("Family", "family", 400, true, 0),
+        );
+
+        let reverse = build_reverse_index_records(&records);
+        let entries = reverse.get("family").expect("family alias exists");
+
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.relative_path == "Family-Regular.ttf")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.relative_path == "Family-Bold.ttf")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.relative_path == "Family-Italic.ttf")
+        );
+    }
+
+    #[test]
+    fn reverse_index_deduplicates_same_family_style() {
+        let mut records = BTreeMap::new();
+        records.insert(
+            "Family-Regular-A.ttf".to_owned(),
+            record("Family", "family", 400, false, 0),
+        );
+        records.insert(
+            "Family-Regular-B.ttf".to_owned(),
+            record("Family", "family", 400, false, 0),
+        );
+
+        let reverse = build_reverse_index_records(&records);
+        let entries = reverse.get("family").expect("family alias exists");
+
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn reverse_entries_round_trip() {
+        let mut records = BTreeMap::new();
+        records.insert(
+            "Family-Regular.ttf".to_owned(),
+            record("Family", "family", 400, false, 7),
+        );
+
+        let reverse = build_reverse_index_records(&records);
+        let entries = reverse.get("family").expect("family alias exists");
+        let encoded = encode_reverse_entries(entries);
+        let decoded = decode_reverse_entries(&encoded);
+
+        assert_eq!(decoded, *entries);
+    }
+
+    fn record(
+        alias_raw: &str,
+        family_norm: &str,
+        weight_class: u16,
+        is_italic: bool,
+        face_index: u32,
+    ) -> FontFileIndexRecord {
+        FontFileIndexRecord {
+            file_size: 1,
+            modified_at: 1,
+            extension: "ttf".to_owned(),
+            faces: Vec::new(),
+            aliases: vec![FontAliasRecord {
+                alias_raw: alias_raw.to_owned(),
+                alias_norm: alias_raw.to_lowercase(),
+                alias_kind: "family".to_owned(),
+                face_index,
+                family_name: Some(alias_raw.to_owned()),
+                family_norm: Some(family_norm.to_owned()),
+                subfamily_name: None,
+                full_name: None,
+                postscript_name: None,
+                weight_class: Some(weight_class),
+                is_italic,
+                name_id: 1,
+                platform_id: Some(3),
+                encoding_id: Some(1),
+                language_id: Some(0x0409),
+                priority: 300,
+            }],
+        }
+    }
 }
