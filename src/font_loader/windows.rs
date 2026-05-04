@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use windows_sys::Win32::{
     Foundation::{LPARAM, WPARAM},
     Graphics::Gdi::{AddFontResourceW, RemoveFontResourceW},
-    UI::WindowsAndMessaging::{HWND_BROADCAST, SendMessageW, WM_FONTCHANGE},
+    UI::WindowsAndMessaging::{HWND_BROADCAST, SendNotifyMessageW, WM_FONTCHANGE},
 };
 
 fn to_wide_path(path: &Path) -> Vec<u16> {
@@ -37,8 +37,11 @@ pub fn remove_font_resource(path: &Path) -> Result<()> {
 }
 
 pub fn broadcast_font_change() -> Result<()> {
-    unsafe {
-        SendMessageW(HWND_BROADCAST, WM_FONTCHANGE, 0 as WPARAM, 0 as LPARAM);
+    let sent =
+        unsafe { SendNotifyMessageW(HWND_BROADCAST, WM_FONTCHANGE, 0 as WPARAM, 0 as LPARAM) };
+
+    if sent == 0 {
+        bail!("failed to broadcast font-change notification");
     }
 
     Ok(())
