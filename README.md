@@ -14,6 +14,8 @@ load font files so other Windows programs can see them.
 - Parse ASS/SSA styles and override tags such as `\fn` and `\r`
 - Analyze font family, full-name, and PostScript-name aliases
 - Store searchable font aliases in a SQLite index
+- Use a native Windows GUI to index a font directory, resolve subtitle fonts,
+  and temporarily load only the local fonts that are needed
 - Export font alias data to CSV
 
 ## Requirements
@@ -133,6 +135,27 @@ collapse, case folding, and leading `@` removal. Re-scans skip unchanged files
 and mark previously indexed files unavailable when they disappear from the scan
 root.
 
+### `sub_font_loader_gui`
+
+Open the native Windows GUI:
+
+```powershell
+cargo run --bin sub_font_loader_gui
+```
+
+The GUI stores `sub_font_loader.toml` and `font_index.sqlite` next to the GUI
+executable. If `font_root` is empty in the config file, the executable directory
+is used as the default font directory. By default the GUI updates the index on
+startup, auto-loads subtitle inputs passed through argv, and skips local fonts
+whose aliases are already available from system-installed fonts.
+
+```toml
+font_root = ""
+auto_index_on_startup = true
+auto_load_startup_subtitles = true
+avoid_system_fonts = true
+```
+
 ## Typical Workflow
 
 1. Index your local font library:
@@ -160,6 +183,7 @@ root.
 - `discover`: recursive and top-level font discovery
 - `font`: font name-table analysis and SQLite indexing
 - `font_loader`: Windows font registration wrappers
+- `gui`: Windows-only native GUI and background worker orchestration
 - `input`: directory/archive preparation
 - `session`: load/unload lifecycle management
 - `subtitle`: ASS/SSA parsing and font usage analysis

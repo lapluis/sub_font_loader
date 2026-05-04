@@ -174,6 +174,109 @@ impl FontIndex {
         Ok(summary)
     }
 
+    pub fn rebuild_root(&mut self, root: &Path) -> Result<ScanSummary> {
+        let root_path = canonicalize_font_root(root)?;
+        self.clear_index_data()?;
+        let summary = self.scan_root(&root_path)?;
+        self.set_active_font_root(&summary.root)?;
+        Ok(summary)
+    }
+
+    pub fn update_bound_root(&mut self, root: &Path) -> Result<ScanSummary> {
+        let root_path = canonicalize_font_root(root)?;
+        let summary = self.scan_root(&root_path)?;
+        self.set_active_font_root(&summary.root)?;
+        Ok(summary)
+    }
+
+    pub fn clear_index_data(&mut self) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("failed to start font index clear transaction")?;
+
+        tx.execute("DELETE FROM font_aliases", [])
+            .context("failed to clear font aliases")?;
+        tx.execute("DELETE FROM font_faces", [])
+            .context("failed to clear font faces")?;
+        tx.execute("DELETE FROM font_files", [])
+            .context("failed to clear font files")?;
+        tx.execute("DELETE FROM scan_roots", [])
+            .context("failed to clear scan roots")?;
+        tx.execute("DELETE FROM index_meta WHERE key = 'active_font_root'", [])
+            .context("failed to clear active font root metadata")?;
+
+        tx.commit()
+            .context("failed to commit font index clear transaction")?;
+        Ok(())
+    }
+
+    pub fn active_font_root(&self) -> Result<Option<PathBuf>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'active_font_root'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to read active font root metadata")
+            .map(|value| value.map(PathBuf::from))
+    }
+
+    pub fn set_active_font_root(&self, root: &Path) -> Result<()> {
+        let root_path = canonicalize_font_root(root)?;
+        self.conn
+            .execute(
+                "INSERT INTO index_meta (key, value)
+                 VALUES ('active_font_root', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![path_to_db_text(&root_path)],
+            )
+            .context("failed to write active font root metadata")?;
+        Ok(())
+    }
+
+    pub fn summary_for_root(&self, root: &Path) -> Result<ScanSummary> {
+        let root_path = canonicalize_font_root(root)?;
+        let root_text = path_to_db_text(&root_path);
+
+        let scanned_files = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM font_files files
+                 JOIN scan_roots roots ON roots.id = files.root_id
+                 WHERE roots.root_path = ?1
+                   AND files.is_available = 1",
+                params![&root_text],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("failed to count indexed font files")
+            .map(i64_to_usize)?;
+
+        let indexed_files = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT files.id)
+                 FROM font_files files
+                 JOIN scan_roots roots ON roots.id = files.root_id
+                 JOIN font_faces faces ON faces.file_id = files.id
+                 WHERE roots.root_path = ?1
+                   AND files.is_available = 1",
+                params![&root_text],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("failed to count indexed font faces")
+            .map(i64_to_usize)?;
+
+        Ok(ScanSummary {
+            root: root_path,
+            scanned_files,
+            indexed_files,
+            ..ScanSummary::default()
+        })
+    }
+
     pub fn query_alias(&self, font_name: &str) -> Result<Vec<FontMatch>> {
         let alias_norm = normalize_font_name(font_name);
         if alias_norm.is_empty() {
@@ -370,6 +473,11 @@ pub fn normalize_font_name(name: &str) -> String {
 fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
+        CREATE TABLE IF NOT EXISTS index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS scan_roots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             root_path TEXT NOT NULL UNIQUE,
@@ -455,6 +563,14 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         ",
     )
     .context("failed to initialize font index schema")
+}
+
+pub fn canonicalize_font_root(root: &Path) -> Result<PathBuf> {
+    if !root.is_dir() {
+        bail!("font root is not a directory: {}", root.display());
+    }
+
+    Ok(canonicalize_path(root))
 }
 
 fn discover_font_paths(root: &Path, summary: &mut ScanSummary) -> Result<Vec<PathBuf>> {
@@ -847,4 +963,8 @@ fn i64_to_u32(value: i64) -> u32 {
 
 fn i64_to_u16(value: i64) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn i64_to_usize(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }

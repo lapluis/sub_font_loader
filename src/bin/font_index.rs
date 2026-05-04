@@ -1,16 +1,12 @@
-use std::{
-    collections::BTreeSet,
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fs::File, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use argh::FromArgs;
 use sub_font_loader::{
+    discover,
     font::index::{FontIndex, FontMatch, ResolveReport, ScanSummary},
     subtitle,
 };
-use walkdir::WalkDir;
 
 /// build and query a local subtitle font index
 #[derive(Debug, FromArgs)]
@@ -116,12 +112,13 @@ fn query(command: QueryCommand) -> Result<()> {
 }
 
 fn resolve_subtitles(command: ResolveSubtitlesCommand) -> Result<()> {
-    let subtitles = discover_subtitles(&command.subtitle_dir).with_context(|| {
-        format!(
-            "failed to discover subtitles in {}",
-            command.subtitle_dir.display()
-        )
-    })?;
+    let subtitles =
+        discover::discover_subtitle_paths([&command.subtitle_dir]).with_context(|| {
+            format!(
+                "failed to discover subtitles in {}",
+                command.subtitle_dir.display()
+            )
+        })?;
 
     if subtitles.is_empty() {
         eprintln!(
@@ -220,47 +217,6 @@ fn print_resolve_report(report: &ResolveReport) {
             println!("  {}", path.display());
         }
     }
-}
-
-fn discover_subtitles(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        bail!("subtitle input does not exist: {}", root.display());
-    }
-
-    if root.is_file() {
-        return Ok(if is_supported_subtitle(root) {
-            vec![root.to_path_buf()]
-        } else {
-            Vec::new()
-        });
-    }
-
-    if !root.is_dir() {
-        bail!(
-            "subtitle input is not a file or directory: {}",
-            root.display()
-        );
-    }
-
-    let mut subtitles = Vec::new();
-    for entry in WalkDir::new(root) {
-        let entry = entry.with_context(|| format!("failed to scan {}", root.display()))?;
-
-        if entry.file_type().is_file() && is_supported_subtitle(entry.path()) {
-            subtitles.push(entry.path().to_path_buf());
-        }
-    }
-
-    subtitles.sort();
-    Ok(subtitles)
-}
-
-fn is_supported_subtitle(path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-        return false;
-    };
-
-    matches!(extension.to_ascii_lowercase().as_str(), "ass" | "ssa")
 }
 
 fn print_set(title: &str, values: &BTreeSet<String>) {
