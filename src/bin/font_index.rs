@@ -172,7 +172,14 @@ fn print_query_matches(matches: &[FontMatch]) {
         println!("Requested: {}", font_match.requested_name);
         println!("Matched alias: {}", font_match.matched_alias);
         println!("Alias kind: {}", font_match.alias_kind);
-        println!("Face index: {}", font_match.face_index);
+        println!("Relative path: {}", font_match.relative_path);
+        println!("Name ID: {}", font_match.name_id);
+        println!(
+            "Platform/encoding/language: {}/{}/{}",
+            optional_u16_text(font_match.platform_id),
+            optional_u16_text(font_match.encoding_id),
+            optional_u16_text(font_match.language_id)
+        );
         println!("Path: {}", font_match.font_path.display());
         println!();
     }
@@ -188,10 +195,9 @@ fn print_resolve_report(report: &ResolveReport) {
             println!("  {}", resolved.requested_name);
             for font_match in &resolved.matches {
                 println!(
-                    "    {} [{} face #{}] {}",
+                    "    {} [{}] {}",
                     font_match.matched_alias,
                     font_match.alias_kind,
-                    font_match.face_index,
                     font_match.font_path.display()
                 );
             }
@@ -231,4 +237,10 @@ fn print_set(title: &str, values: &BTreeSet<String>) {
     for value in values {
         println!("  {value}");
     }
+}
+
+fn optional_u16_text(value: Option<u16>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
 }

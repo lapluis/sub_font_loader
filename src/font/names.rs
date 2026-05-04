@@ -144,7 +144,7 @@ fn platform_id_name(platform_id: PlatformId) -> &'static str {
 }
 
 fn normalize_alias(value: &str) -> Option<String> {
-    let normalized = value.trim().trim_start_matches('@').trim();
+    let normalized = value.trim();
 
     if normalized.is_empty() {
         None
