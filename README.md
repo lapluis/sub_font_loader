@@ -1,9 +1,8 @@
 # Sub Font Loader
 
-Sub Font Loader is a Windows-focused Rust toolkit for working with fonts used by
-ASS/SSA subtitles. It can inspect subtitle files for required font families,
-analyze font name aliases, build a local redb index of fonts, and temporarily
-load font files so other Windows programs can see them.
+Sub Font Loader is a Windows-focused Rust toolkit for working with fonts used by ASS/SSA subtitles. It can inspect subtitle files for required font families, analyze font name aliases, build a local redb index of fonts, and temporarily load font files so other Windows programs can see them.
+
+Inspired by [yzwduck/FontLoaderSub](https://github.com/yzwduck/FontLoaderSub).
 
 ## Features
 
@@ -20,27 +19,24 @@ load font files so other Windows programs can see them.
 
 ## Requirements
 
-- Windows
+- Windows **ONLY**
 - Rust toolchain with Cargo
-
-The font loading path uses Windows GDI APIs (`AddFontResourceW`,
-`RemoveFontResourceW`, and `WM_FONTCHANGE`), so this project is currently aimed
-at Windows builds.
 
 ## Build
 
 ```powershell
-cargo build --release
+git clone https://github.com/lapluis/sub_font_loader.git
+cd sub_font_loader
+cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-The compiled binaries are written under `target\release\`.
+The compiled binaries are written under `target\x86_64-pc-windows-msvc\release\`.
 
 ## Binaries
 
 ### `font_loader`
 
-Temporarily load fonts from a directory or archive. Loaded fonts stay visible to
-other programs until you press Enter, press Ctrl+C, or the process exits.
+Temporarily load fonts from a directory or archive. Loaded fonts stay visible to other programs until you press Enter, press Ctrl+C, or the process exits.
 
 ```powershell
 cargo run --bin font_loader -- <directory-or-archive>
@@ -64,8 +60,7 @@ Options:
 
 ### `subtitle_fonts`
 
-Analyze ASS/SSA subtitle files and print the fonts they require without loading
-anything.
+Analyze ASS/SSA subtitle files and print the fonts they require without loading anything.
 
 ```powershell
 cargo run --bin subtitle_fonts -- <subtitle-file-or-directory>
@@ -103,8 +98,7 @@ cargo run --bin font_analysis -- -o aliases.csv .\fonts
 
 ### `font_index`
 
-Build and query a redb font alias index. The default database path is
-`font_index.redb`.
+Build and query a redb font alias index. The default database path is `font_index.redb`.
 
 Scan a font directory:
 
@@ -130,10 +124,7 @@ Export indexed aliases:
 cargo run --bin font_index -- export-csv --db font_index.redb aliases.csv
 ```
 
-The index normalizes font names with Unicode NFKC normalization, whitespace
-collapse, case folding, and leading `@` removal. Re-scans skip unchanged files
-and mark previously indexed files unavailable when they disappear from the scan
-root.
+The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Re-scans skip unchanged files and mark previously indexed files unavailable when they disappear from the scan root.
 
 ### `sub_font_loader_gui`
 
@@ -143,11 +134,7 @@ Open the native Windows GUI:
 cargo run --bin sub_font_loader_gui
 ```
 
-The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI
-executable. If `font_root` is empty in the config file, the executable directory
-is used as the default font directory. By default the GUI updates the index on
-startup, auto-loads subtitle inputs passed through argv, and skips local fonts
-whose aliases are already available from system-installed fonts.
+The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI executable. If `font_root` is empty in the config file, the executable directory is used as the default font directory. By default the GUI updates the index on startup, auto-loads subtitle inputs passed through argv, and skips local fonts whose aliases are already available from system-installed fonts.
 
 ```toml
 font_root = ""
@@ -170,9 +157,8 @@ avoid_system_fonts = true
    cargo run --bin font_index -- resolve-subtitles .\subs
    ```
 
-3. Temporarily load a folder or release archive of fonts while muxing, previewing,
-   or rendering:
-
+3. Temporarily load a folder or release archive of fonts while muxing, previewing, or rendering:
+   
    ```powershell
    cargo run --bin font_loader -- .\fonts
    ```
@@ -188,16 +174,6 @@ avoid_system_fonts = true
 - `session`: load/unload lifecycle management
 - `subtitle`: ASS/SSA parsing and font usage analysis
 
-## Development
+## TODO
 
-```powershell
-cargo fmt
-cargo test
-```
-
-The project stores its font index with redb, so a separate database installation
-is not required.
-
-## License
-
-This project is licensed under the terms in [LICENSE](LICENSE).
+- [ ] Detection of font actually used by subtitles 
