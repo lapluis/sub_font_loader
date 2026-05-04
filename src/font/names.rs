@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use encoding_rs::UTF_16BE;
 use ttf_parser::{Face, PlatformId, name::Name, name_id};
 
 const ALIAS_NAME_IDS: &[u16] = &[
@@ -79,12 +80,12 @@ fn decode_utf16be_name(bytes: &[u8]) -> Option<String> {
         return None;
     }
 
-    let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-        .collect::<Vec<_>>();
-
-    String::from_utf16(&units).ok()
+    let (value, had_errors) = UTF_16BE.decode_without_bom_handling(bytes);
+    if had_errors {
+        None
+    } else {
+        Some(value.into_owned())
+    }
 }
 
 fn is_usable_name(value: &str) -> bool {
