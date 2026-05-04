@@ -134,6 +134,7 @@ fn resolve_subtitles(command: ResolveSubtitlesCommand) -> Result<()> {
 
     println!("Found {} subtitle file(s).", subtitles.len());
     print_set("Required fonts", &report.required_fonts);
+    print_set("Declared but unused", &report.declared_but_unused_fonts);
     print_resolve_report(&resolved);
     Ok(())
 }

@@ -205,6 +205,11 @@ fn load_subtitles(
 
     let font_report = subtitle::analyze_subtitle_font_report(&subtitles)?;
     let required_alias_count = font_report.required_fonts.len();
+    let declared_but_unused_aliases = font_report
+        .declared_but_unused_fonts
+        .iter()
+        .cloned()
+        .collect();
     let mut system_aliases = Vec::new();
     let mut local_aliases = Vec::new();
 
@@ -233,6 +238,7 @@ fn load_subtitles(
     let view = SubtitleLoadView::from_resolve_report(
         subtitles.len(),
         required_alias_count,
+        declared_but_unused_aliases,
         system_aliases,
         resolve_report,
         &load_summary,

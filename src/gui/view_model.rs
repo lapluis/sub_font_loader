@@ -9,10 +9,12 @@ use crate::{font::index::ResolveReport, session::LoadSummary};
 pub struct SubtitleLoadView {
     pub subtitle_count: usize,
     pub required_alias_count: usize,
+    pub declared_but_unused_alias_count: usize,
     pub skipped_system_alias_count: usize,
     pub loaded_local_font_count: usize,
     pub missing_alias_count: usize,
     pub local_groups: Vec<LocalFontGroup>,
+    pub declared_but_unused_aliases: Vec<String>,
     pub system_aliases: Vec<String>,
     pub missing_aliases: Vec<String>,
 }
@@ -28,6 +30,7 @@ impl SubtitleLoadView {
     pub fn from_resolve_report(
         subtitle_count: usize,
         required_alias_count: usize,
+        declared_but_unused_aliases: Vec<String>,
         system_aliases: Vec<String>,
         report: ResolveReport,
         load_summary: &LoadSummary,
@@ -56,15 +59,18 @@ impl SubtitleLoadView {
         let loaded_local_font_count = local_groups.iter().filter(|group| group.loaded).count();
         let missing_aliases = report.missing;
         let missing_alias_count = missing_aliases.len();
+        let declared_but_unused_alias_count = declared_but_unused_aliases.len();
         let skipped_system_alias_count = system_aliases.len();
 
         Self {
             subtitle_count,
             required_alias_count,
+            declared_but_unused_alias_count,
             skipped_system_alias_count,
             loaded_local_font_count,
             missing_alias_count,
             local_groups,
+            declared_but_unused_aliases,
             system_aliases,
             missing_aliases,
         }
@@ -93,6 +99,13 @@ impl SubtitleLoadView {
             &mut output,
             format!("Required aliases: {}", self.required_alias_count),
         );
+        push_line(
+            &mut output,
+            format!(
+                "Declared but unused: {}",
+                self.declared_but_unused_alias_count
+            ),
+        );
         output.push('\n');
 
         push_line(&mut output, "[LOCAL LOADED]".to_owned());
@@ -116,6 +129,12 @@ impl SubtitleLoadView {
 
         push_line(&mut output, "[MISSING]".to_owned());
         for alias in &self.missing_aliases {
+            push_line(&mut output, format!("- {alias}"));
+        }
+        output.push('\n');
+
+        push_line(&mut output, "[DECLARED BUT UNUSED]".to_owned());
+        for alias in &self.declared_but_unused_aliases {
             push_line(&mut output, format!("- {alias}"));
         }
 
@@ -183,6 +202,7 @@ mod tests {
         let view = SubtitleLoadView::from_resolve_report(
             13,
             4,
+            vec!["Unused Display".to_owned()],
             vec!["System Sans".to_owned()],
             report,
             &load_summary,
@@ -196,6 +216,7 @@ mod tests {
                 "Missing fonts: 1\n",
                 "Subtitle files: 13\n",
                 "Required aliases: 4\n",
+                "Declared but unused: 1\n",
                 "\n",
                 "[LOCAL LOADED]\n",
                 "- Alpha.ttf\n",
@@ -207,6 +228,9 @@ mod tests {
                 "\n",
                 "[MISSING]\n",
                 "- Missing Serif\n",
+                "\n",
+                "[DECLARED BUT UNUSED]\n",
+                "- Unused Display\n",
             )
         );
     }

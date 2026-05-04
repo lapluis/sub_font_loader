@@ -116,10 +116,11 @@ impl LoadStatus {
             Self::ResolvingFonts => "Load status: resolving fonts".to_owned(),
             Self::LoadingFonts => "Load status: loading fonts".to_owned(),
             Self::Loaded(view) => format!(
-                "Load complete: {} local, {} system skipped, {} missing",
+                "Load complete: {} local, {} system skipped, {} missing, {} declared unused",
                 view.loaded_local_font_count,
                 view.skipped_system_alias_count,
-                view.missing_alias_count
+                view.missing_alias_count,
+                view.declared_but_unused_alias_count
             ),
             Self::Failed(error) => format!("Load failed: {error}"),
         }

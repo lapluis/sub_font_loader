@@ -11,6 +11,7 @@ use super::{ass, encoding};
 pub struct SubtitleFontUsage {
     pub declared_fonts: BTreeSet<String>,
     pub required_fonts: BTreeSet<String>,
+    pub declared_but_unused_fonts: BTreeSet<String>,
     pub inline_fonts: BTreeSet<String>,
     pub missing_styles: BTreeSet<String>,
 }
@@ -20,6 +21,7 @@ pub struct SubtitleFontReport {
     pub files: BTreeMap<PathBuf, SubtitleFontUsage>,
     pub declared_fonts: BTreeSet<String>,
     pub required_fonts: BTreeSet<String>,
+    pub declared_but_unused_fonts: BTreeSet<String>,
     pub inline_fonts: BTreeSet<String>,
     pub missing_styles: BTreeSet<String>,
 }
@@ -43,6 +45,9 @@ pub fn analyze_ass_text(text: &str) -> SubtitleFontUsage {
         analyze_override_tags(&dialogue.text, &dialogue.style, &style_fonts, &mut usage);
     }
 
+    usage.declared_but_unused_fonts =
+        declared_but_unused_fonts(&usage.declared_fonts, &usage.required_fonts);
+
     usage
 }
 
@@ -64,6 +69,9 @@ pub fn analyze_subtitle_font_report(paths: &[PathBuf]) -> Result<SubtitleFontRep
         extend_ci(&mut report.missing_styles, &usage.missing_styles);
         report.files.insert(path.clone(), usage);
     }
+
+    report.declared_but_unused_fonts =
+        declared_but_unused_fonts(&report.declared_fonts, &report.required_fonts);
 
     Ok(report)
 }
@@ -188,6 +196,21 @@ fn extend_ci(target: &mut BTreeSet<String>, source: &BTreeSet<String>) {
     }
 }
 
+fn declared_but_unused_fonts(
+    declared_fonts: &BTreeSet<String>,
+    required_fonts: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut unused_fonts = BTreeSet::new();
+
+    for font_name in declared_fonts {
+        if !contains_ci(required_fonts, font_name) {
+            insert_ci(&mut unused_fonts, font_name.clone());
+        }
+    }
+
+    unused_fonts
+}
+
 fn insert_ci(target: &mut BTreeSet<String>, value: String) {
     if !target
         .iter()
@@ -195,4 +218,10 @@ fn insert_ci(target: &mut BTreeSet<String>, value: String) {
     {
         target.insert(value);
     }
+}
+
+fn contains_ci(values: &BTreeSet<String>, value: &str) -> bool {
+    values
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(value))
 }

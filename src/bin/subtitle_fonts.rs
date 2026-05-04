@@ -39,6 +39,7 @@ fn main() -> Result<()> {
 
     println!("Found {} subtitle file(s).", subtitles.len());
     print_set("Required fonts", &report.required_fonts);
+    print_set("Declared but unused", &report.declared_but_unused_fonts);
 
     if !report.declared_fonts.is_empty() {
         print_set("Declared fonts", &report.declared_fonts);

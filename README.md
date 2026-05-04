@@ -77,6 +77,7 @@ The report includes:
 
 - Required fonts used by styles and inline tags
 - Declared style fonts
+- Declared style fonts that are not used by any dialogue
 - Inline fonts from override tags
 - Missing styles referenced by dialogue lines
 
@@ -173,7 +174,3 @@ avoid_system_fonts = true
 - `input`: directory/archive preparation
 - `session`: load/unload lifecycle management
 - `subtitle`: ASS/SSA parsing and font usage analysis
-
-## TODO
-
-- [ ] Detection of font actually used by subtitles 
