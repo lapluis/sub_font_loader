@@ -10,7 +10,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::de::DeserializeOwned;
 use sub_font_loader::font::index::{FontFileIndexRecord, MetaRecord};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const META_KEY: &str = "state";
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");

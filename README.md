@@ -125,7 +125,7 @@ Export indexed names:
 cargo run --bin font_index -- export-csv --db font_index.redb names.csv
 ```
 
-The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Index updates compare file path, size, and modification time, skip unchanged files, remove files that disappeared from the scan root, and analyze only new or modified font files. Reverse lookup maps normalized family, full, and PostScript names to deduplicated font file paths; subfamily names are retained in the forward index for inspection.
+The index normalizes font names with Unicode NFKC normalization, whitespace collapse, case folding, and leading `@` removal. Index updates compare file path, size, and nanosecond modification time, skip unchanged files, remove files that disappeared from the scan root, and analyze only new or modified font files. Reverse lookup maps normalized family, full, and PostScript names to deduplicated font file paths; subfamily names are retained in the forward index for inspection.
 
 ### `sub_font_loader_gui`
 

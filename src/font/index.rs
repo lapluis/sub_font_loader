@@ -16,7 +16,7 @@ use crate::discover;
 
 use super::{FontFileAnalysis, analyze_font_file};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const META_KEY: &str = "state";
 const INDEXED_NAME_IDS: &[u16] = &[1, 2, 4, 6, 16, 17];
 const REVERSE_NAME_IDS: &[u16] = &[1, 4, 6, 16];
@@ -55,7 +55,7 @@ pub struct MetaRecord {
 pub struct FontFileIndexRecord {
     pub file_size: u64,
 
-    /// Unix timestamp.
+    /// Unix timestamp in nanoseconds.
     pub modified_at: i64,
 
     /// Lowercase extension without dot, for example "ttf", "otf", or "ttc".
@@ -208,7 +208,7 @@ impl FontIndex {
             let file_size = metadata.len();
             let modified_at = metadata
                 .modified()
-                .map(system_time_to_unix_timestamp)
+                .map(system_time_to_unix_timestamp_nanos)
                 .unwrap_or(0);
             let extension = font_path
                 .path
@@ -786,7 +786,7 @@ fn analyze_index_record(
     let file_size = metadata.len();
     let modified_at = metadata
         .modified()
-        .map(system_time_to_unix_timestamp)
+        .map(system_time_to_unix_timestamp_nanos)
         .unwrap_or(0);
     let extension = path
         .extension()
@@ -1100,7 +1100,18 @@ fn system_time_to_unix_timestamp(value: SystemTime) -> i64 {
     }
 }
 
+fn system_time_to_unix_timestamp_nanos(value: SystemTime) -> i64 {
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => u128_to_i64(duration.as_nanos()),
+        Err(_) => 0,
+    }
+}
+
 fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn u128_to_i64(value: u128) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
@@ -1115,6 +1126,7 @@ mod tests {
         encode_reverse_paths,
     };
     use std::collections::BTreeMap;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn reverse_index_maps_name_to_sorted_deduplicated_paths() {
@@ -1207,6 +1219,17 @@ mod tests {
         let decoded = decode_reverse_paths(&encoded);
 
         assert_eq!(decoded, vec!["Family-Regular.ttf".to_owned()]);
+    }
+
+    #[test]
+    fn modified_timestamp_keeps_subsecond_precision() {
+        let first = UNIX_EPOCH + Duration::new(1, 100);
+        let second = UNIX_EPOCH + Duration::new(1, 200);
+
+        assert_ne!(
+            super::system_time_to_unix_timestamp_nanos(first),
+            super::system_time_to_unix_timestamp_nanos(second)
+        );
     }
 
     fn record(names: Vec<FontNameRecord>) -> FontFileIndexRecord {
