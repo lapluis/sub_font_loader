@@ -2,7 +2,7 @@
 
 Sub Font Loader is a Windows-focused Rust toolkit for working with fonts used by
 ASS/SSA subtitles. It can inspect subtitle files for required font families,
-analyze font name aliases, build a local SQLite index of fonts, and temporarily
+analyze font name aliases, build a local redb index of fonts, and temporarily
 load font files so other Windows programs can see them.
 
 ## Features
@@ -13,7 +13,7 @@ load font files so other Windows programs can see them.
 - Temporarily register fonts with Windows and unload them on exit
 - Parse ASS/SSA styles and override tags such as `\fn` and `\r`
 - Analyze font family, full-name, and PostScript-name aliases
-- Store searchable font aliases in a SQLite index
+- Store searchable font aliases in a redb index
 - Use a native Windows GUI to index a font directory, resolve subtitle fonts,
   and temporarily load only the local fonts that are needed
 - Export font alias data to CSV
@@ -103,31 +103,31 @@ cargo run --bin font_analysis -- -o aliases.csv .\fonts
 
 ### `font_index`
 
-Build and query a SQLite font alias index. The default database path is
-`font_index.sqlite`.
+Build and query a redb font alias index. The default database path is
+`font_index.redb`.
 
 Scan a font directory:
 
 ```powershell
-cargo run --bin font_index -- scan --db font_index.sqlite .\fonts
+cargo run --bin font_index -- scan --db font_index.redb .\fonts
 ```
 
 Query one font name or alias:
 
 ```powershell
-cargo run --bin font_index -- query --db font_index.sqlite "Noto Sans CJK SC"
+cargo run --bin font_index -- query --db font_index.redb "Noto Sans CJK SC"
 ```
 
 Resolve fonts required by subtitle files:
 
 ```powershell
-cargo run --bin font_index -- resolve-subtitles --db font_index.sqlite .\subs
+cargo run --bin font_index -- resolve-subtitles --db font_index.redb .\subs
 ```
 
 Export indexed aliases:
 
 ```powershell
-cargo run --bin font_index -- export-csv --db font_index.sqlite aliases.csv
+cargo run --bin font_index -- export-csv --db font_index.redb aliases.csv
 ```
 
 The index normalizes font names with Unicode NFKC normalization, whitespace
@@ -143,7 +143,7 @@ Open the native Windows GUI:
 cargo run --bin sub_font_loader_gui
 ```
 
-The GUI stores `sub_font_loader.toml` and `font_index.sqlite` next to the GUI
+The GUI stores `sub_font_loader.toml` and `font_index.redb` next to the GUI
 executable. If `font_root` is empty in the config file, the executable directory
 is used as the default font directory. By default the GUI updates the index on
 startup, auto-loads subtitle inputs passed through argv, and skips local fonts
@@ -181,7 +181,7 @@ avoid_system_fonts = true
 
 - `archive`: safe extraction for ZIP, 7z, and RAR inputs
 - `discover`: recursive and top-level font discovery
-- `font`: font name-table analysis and SQLite indexing
+- `font`: font name-table analysis and redb indexing
 - `font_loader`: Windows font registration wrappers
 - `gui`: Windows-only native GUI and background worker orchestration
 - `input`: directory/archive preparation
@@ -195,8 +195,8 @@ cargo fmt
 cargo test
 ```
 
-The project uses bundled SQLite through `rusqlite`, so a separate SQLite
-installation is not required.
+The project stores its font index with redb, so a separate database installation
+is not required.
 
 ## License
 

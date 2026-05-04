@@ -33,7 +33,7 @@ struct ScanCommand {
     #[argh(positional)]
     font_dir: PathBuf,
 
-    /// SQLite database path; defaults to font_index.sqlite
+    /// redb database path; defaults to font_index.redb
     #[argh(option)]
     db: Option<PathBuf>,
 }
@@ -46,7 +46,7 @@ struct QueryCommand {
     #[argh(positional)]
     font_name: String,
 
-    /// SQLite database path; defaults to font_index.sqlite
+    /// redb database path; defaults to font_index.redb
     #[argh(option)]
     db: Option<PathBuf>,
 }
@@ -59,7 +59,7 @@ struct ResolveSubtitlesCommand {
     #[argh(positional)]
     subtitle_dir: PathBuf,
 
-    /// SQLite database path; defaults to font_index.sqlite
+    /// redb database path; defaults to font_index.redb
     #[argh(option)]
     db: Option<PathBuf>,
 }
@@ -72,7 +72,7 @@ struct ExportCsvCommand {
     #[argh(positional)]
     csv_path: PathBuf,
 
-    /// SQLite database path; defaults to font_index.sqlite
+    /// redb database path; defaults to font_index.redb
     #[argh(option)]
     db: Option<PathBuf>,
 }
@@ -152,7 +152,7 @@ fn export_csv(command: ExportCsvCommand) -> Result<()> {
 }
 
 fn db_path(value: Option<PathBuf>) -> PathBuf {
-    value.unwrap_or_else(|| PathBuf::from("font_index.sqlite"))
+    value.unwrap_or_else(|| PathBuf::from("font_index.redb"))
 }
 
 fn print_scan_summary(summary: &ScanSummary) {

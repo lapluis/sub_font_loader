@@ -1,5 +1,6 @@
 use std::{
-    collections::HashSet,
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -7,7 +8,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use redb::{Database, ReadableDatabase, TableDefinition};
+use serde::{Deserialize, Serialize};
 use ttf_parser::name_id;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -16,8 +18,12 @@ use crate::discover;
 
 use super::{FontAlias, FontFaceAnalysis, analyze_font_file};
 
+const INDEX_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index_state");
+const INDEX_STATE_KEY: &str = "state";
+
 pub struct FontIndex {
-    conn: Connection,
+    db: Database,
+    state: RefCell<IndexState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,19 +67,123 @@ pub struct ResolvedFont {
 
 #[derive(Debug, Clone, Copy)]
 struct ExistingFontFile {
-    id: i64,
+    id: u64,
     file_size: i64,
     modified_at: i64,
 }
 
+#[derive(Debug, Clone)]
+struct SortedFontMatch {
+    root_priority: i64,
+    alias_priority: i64,
+    file_path: String,
+    face_index: u32,
+    alias_raw: String,
+    font_match: FontMatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct IndexState {
+    next_root_id: u64,
+    next_file_id: u64,
+    next_face_id: u64,
+    next_alias_id: u64,
+    active_font_root: Option<String>,
+    scan_roots: BTreeMap<u64, ScanRootRecord>,
+    root_by_path: BTreeMap<String, u64>,
+    font_files: BTreeMap<u64, FontFileRecord>,
+    file_by_canonical_path: BTreeMap<String, u64>,
+    font_faces: BTreeMap<u64, FontFaceRecord>,
+    face_ids_by_file: BTreeMap<u64, Vec<u64>>,
+    font_aliases: BTreeMap<u64, FontAliasRecord>,
+    alias_ids_by_face: BTreeMap<u64, Vec<u64>>,
+    alias_ids_by_norm: BTreeMap<String, Vec<u64>>,
+}
+
+impl Default for IndexState {
+    fn default() -> Self {
+        Self {
+            next_root_id: 1,
+            next_file_id: 1,
+            next_face_id: 1,
+            next_alias_id: 1,
+            active_font_root: None,
+            scan_roots: BTreeMap::new(),
+            root_by_path: BTreeMap::new(),
+            font_files: BTreeMap::new(),
+            file_by_canonical_path: BTreeMap::new(),
+            font_faces: BTreeMap::new(),
+            face_ids_by_file: BTreeMap::new(),
+            font_aliases: BTreeMap::new(),
+            alias_ids_by_face: BTreeMap::new(),
+            alias_ids_by_norm: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanRootRecord {
+    root_path: String,
+    root_kind: String,
+    priority: i64,
+    created_at: i64,
+    updated_at: i64,
+    last_scanned_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FontFileRecord {
+    root_id: u64,
+    path: String,
+    canonical_path: String,
+    extension: String,
+    file_size: i64,
+    modified_at: i64,
+    is_available: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FontFaceRecord {
+    file_id: u64,
+    face_index: u32,
+    family_name: Option<String>,
+    subfamily_name: Option<String>,
+    full_name: Option<String>,
+    postscript_name: Option<String>,
+    weight_class: Option<i64>,
+    width_class: Option<i64>,
+    is_italic: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FontAliasRecord {
+    face_id: u64,
+    alias_raw: String,
+    alias_norm: String,
+    alias_kind: String,
+    language: Option<String>,
+    platform_id: Option<i64>,
+    name_id: i64,
+    priority: i64,
+    created_at: i64,
+}
+
 impl FontIndex {
     pub fn open(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("failed to open font index database {}", db_path.display()))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .context("failed to enable SQLite foreign keys")?;
-        initialize_schema(&conn)?;
-        Ok(Self { conn })
+        let db = Database::create(db_path)
+            .with_context(|| format!("failed to open redb font index {}", db_path.display()))?;
+        initialize_store(&db)?;
+        let state = load_state(&db)?;
+
+        Ok(Self {
+            db,
+            state: RefCell::new(state),
+        })
     }
 
     pub fn scan_root(&mut self, root: &Path) -> Result<ScanSummary> {
@@ -90,11 +200,8 @@ impl FontIndex {
         summary.scanned_files = font_paths.len();
 
         let now = unix_timestamp_now();
-        let tx = self
-            .conn
-            .transaction()
-            .context("failed to start font index transaction")?;
-        let root_id = upsert_scan_root(&tx, &root_path, now)?;
+        let mut state = self.state.borrow().clone();
+        let root_id = upsert_scan_root(&mut state, &root_path, now);
         let mut seen_paths = HashSet::new();
 
         for path in font_paths {
@@ -126,16 +233,23 @@ impl FontIndex {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
 
-            if let Some(existing) = find_existing_font_file(&tx, &canonical_path_text)? {
+            if let Some(existing) = find_existing_font_file(&state, &canonical_path_text) {
                 if existing.file_size == file_size && existing.modified_at == modified_at {
-                    mark_font_file_seen(&tx, existing.id, root_id, &path_text, &extension, now)?;
+                    mark_font_file_seen(
+                        &mut state,
+                        existing.id,
+                        root_id,
+                        &path_text,
+                        &extension,
+                        now,
+                    )?;
                     summary.skipped_unchanged_files += 1;
                     continue;
                 }
             }
 
             let file_id = upsert_font_file(
-                &tx,
+                &mut state,
                 root_id,
                 &path_text,
                 &canonical_path_text,
@@ -143,13 +257,13 @@ impl FontIndex {
                 file_size,
                 modified_at,
                 now,
-            )?;
-            remove_indexed_faces(&tx, file_id)?;
+            );
+            remove_indexed_faces(&mut state, file_id);
 
             match analyze_font_file(&path) {
                 Ok(analysis) => {
                     for face in &analysis.faces {
-                        insert_font_face(&tx, file_id, face, now)?;
+                        insert_font_face(&mut state, file_id, face, now);
                     }
                     summary.indexed_files += 1;
                 }
@@ -160,17 +274,13 @@ impl FontIndex {
             }
         }
 
-        summary.unavailable_files = mark_unavailable_files(&tx, root_id, &seen_paths, now)?;
-        tx.execute(
-            "UPDATE scan_roots
-             SET last_scanned_at = ?1, updated_at = ?1
-             WHERE id = ?2",
-            params![now, root_id],
-        )
-        .context("failed to update scan root timestamp")?;
-        tx.commit()
-            .context("failed to commit font index transaction")?;
+        summary.unavailable_files = mark_unavailable_files(&mut state, root_id, &seen_paths, now);
+        if let Some(root) = state.scan_roots.get_mut(&root_id) {
+            root.last_scanned_at = Some(now);
+            root.updated_at = now;
+        }
 
+        self.replace_state(state)?;
         Ok(summary)
     }
 
@@ -190,84 +300,54 @@ impl FontIndex {
     }
 
     pub fn clear_index_data(&mut self) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction()
-            .context("failed to start font index clear transaction")?;
-
-        tx.execute("DELETE FROM font_aliases", [])
-            .context("failed to clear font aliases")?;
-        tx.execute("DELETE FROM font_faces", [])
-            .context("failed to clear font faces")?;
-        tx.execute("DELETE FROM font_files", [])
-            .context("failed to clear font files")?;
-        tx.execute("DELETE FROM scan_roots", [])
-            .context("failed to clear scan roots")?;
-        tx.execute("DELETE FROM index_meta WHERE key = 'active_font_root'", [])
-            .context("failed to clear active font root metadata")?;
-
-        tx.commit()
-            .context("failed to commit font index clear transaction")?;
-        Ok(())
+        self.replace_state(IndexState::default())
     }
 
     pub fn active_font_root(&self) -> Result<Option<PathBuf>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM index_meta WHERE key = 'active_font_root'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .context("failed to read active font root metadata")
-            .map(|value| value.map(PathBuf::from))
+        Ok(self
+            .state
+            .borrow()
+            .active_font_root
+            .as_ref()
+            .map(PathBuf::from))
     }
 
     pub fn set_active_font_root(&self, root: &Path) -> Result<()> {
         let root_path = canonicalize_font_root(root)?;
-        self.conn
-            .execute(
-                "INSERT INTO index_meta (key, value)
-                 VALUES ('active_font_root', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![path_to_db_text(&root_path)],
-            )
-            .context("failed to write active font root metadata")?;
-        Ok(())
+        let mut state = self.state.borrow().clone();
+        state.active_font_root = Some(path_to_db_text(&root_path));
+        self.replace_state(state)
     }
 
     pub fn summary_for_root(&self, root: &Path) -> Result<ScanSummary> {
         let root_path = canonicalize_font_root(root)?;
         let root_text = path_to_db_text(&root_path);
+        let state = self.state.borrow();
+        let Some(root_id) = state.root_by_path.get(&root_text).copied() else {
+            return Ok(ScanSummary {
+                root: root_path,
+                ..ScanSummary::default()
+            });
+        };
 
-        let scanned_files = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*)
-                 FROM font_files files
-                 JOIN scan_roots roots ON roots.id = files.root_id
-                 WHERE roots.root_path = ?1
-                   AND files.is_available = 1",
-                params![&root_text],
-                |row| row.get::<_, i64>(0),
-            )
-            .context("failed to count indexed font files")
-            .map(i64_to_usize)?;
+        let scanned_files = state
+            .font_files
+            .values()
+            .filter(|file| file.root_id == root_id && file.is_available)
+            .count();
 
-        let indexed_files = self
-            .conn
-            .query_row(
-                "SELECT COUNT(DISTINCT files.id)
-                 FROM font_files files
-                 JOIN scan_roots roots ON roots.id = files.root_id
-                 JOIN font_faces faces ON faces.file_id = files.id
-                 WHERE roots.root_path = ?1
-                   AND files.is_available = 1",
-                params![&root_text],
-                |row| row.get::<_, i64>(0),
-            )
-            .context("failed to count indexed font faces")
-            .map(i64_to_usize)?;
+        let indexed_files = state
+            .font_files
+            .iter()
+            .filter(|(file_id, file)| {
+                file.root_id == root_id
+                    && file.is_available
+                    && state
+                        .face_ids_by_file
+                        .get(file_id)
+                        .is_some_and(|face_ids| !face_ids.is_empty())
+            })
+            .count();
 
         Ok(ScanSummary {
             root: root_path,
@@ -284,62 +364,63 @@ impl FontIndex {
         }
 
         let requested_name = font_name.to_owned();
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT
-                    aliases.alias_raw,
-                    aliases.alias_kind,
-                    files.path,
-                    files.canonical_path,
-                    faces.face_index,
-                    faces.family_name,
-                    faces.subfamily_name,
-                    faces.full_name,
-                    faces.postscript_name,
-                    faces.weight_class,
-                    faces.is_italic
-                 FROM font_aliases aliases
-                 JOIN font_faces faces ON faces.id = aliases.face_id
-                 JOIN font_files files ON files.id = faces.file_id
-                 JOIN scan_roots roots ON roots.id = files.root_id
-                 WHERE aliases.alias_norm = ?1
-                   AND files.is_available = 1
-                 ORDER BY roots.priority DESC,
-                          aliases.priority DESC,
-                          files.path ASC,
-                          faces.face_index ASC,
-                          aliases.alias_raw ASC",
-            )
-            .context("failed to prepare font alias query")?;
+        let state = self.state.borrow();
+        let Some(alias_ids) = state.alias_ids_by_norm.get(&alias_norm) else {
+            return Ok(Vec::new());
+        };
 
-        let rows = stmt
-            .query_map(params![alias_norm], |row| {
-                let path_text: String = row.get(2)?;
-                let canonical_path_text: String = row.get(3)?;
-                let face_index: i64 = row.get(4)?;
-                let weight_class: Option<i64> = row.get(9)?;
-                let is_italic: i64 = row.get(10)?;
+        let mut rows = Vec::new();
+        for alias_id in alias_ids {
+            let Some(alias) = state.font_aliases.get(alias_id) else {
+                continue;
+            };
+            let Some(face) = state.font_faces.get(&alias.face_id) else {
+                continue;
+            };
+            let Some(file) = state.font_files.get(&face.file_id) else {
+                continue;
+            };
+            if !file.is_available {
+                continue;
+            }
+            let Some(root) = state.scan_roots.get(&file.root_id) else {
+                continue;
+            };
 
-                Ok(FontMatch {
+            rows.push(SortedFontMatch {
+                root_priority: root.priority,
+                alias_priority: alias.priority,
+                file_path: file.path.clone(),
+                face_index: face.face_index,
+                alias_raw: alias.alias_raw.clone(),
+                font_match: FontMatch {
                     requested_name: requested_name.clone(),
-                    matched_alias: row.get(0)?,
-                    alias_kind: row.get(1)?,
-                    font_path: PathBuf::from(path_text),
-                    canonical_path: PathBuf::from(canonical_path_text),
-                    face_index: i64_to_u32(face_index),
-                    family_name: row.get(5)?,
-                    subfamily_name: row.get(6)?,
-                    full_name: row.get(7)?,
-                    postscript_name: row.get(8)?,
-                    weight_class: weight_class.map(i64_to_u16),
-                    is_italic: is_italic != 0,
-                })
-            })
-            .context("failed to query font aliases")?;
+                    matched_alias: alias.alias_raw.clone(),
+                    alias_kind: alias.alias_kind.clone(),
+                    font_path: PathBuf::from(&file.path),
+                    canonical_path: PathBuf::from(&file.canonical_path),
+                    face_index: face.face_index,
+                    family_name: face.family_name.clone(),
+                    subfamily_name: face.subfamily_name.clone(),
+                    full_name: face.full_name.clone(),
+                    postscript_name: face.postscript_name.clone(),
+                    weight_class: face.weight_class.map(i64_to_u16),
+                    is_italic: face.is_italic,
+                },
+            });
+        }
 
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to read font alias matches")
+        rows.sort_by(|left, right| {
+            right
+                .root_priority
+                .cmp(&left.root_priority)
+                .then_with(|| right.alias_priority.cmp(&left.alias_priority))
+                .then_with(|| left.file_path.cmp(&right.file_path))
+                .then_with(|| left.face_index.cmp(&right.face_index))
+                .then_with(|| left.alias_raw.cmp(&right.alias_raw))
+        });
+
+        Ok(rows.into_iter().map(|row| row.font_match).collect())
     }
 
     pub fn resolve_required_fonts<I, S>(&self, required_names: I) -> Result<ResolveReport>
@@ -394,46 +475,45 @@ impl FontIndex {
             ])
             .context("failed to write alias CSV header")?;
 
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT
-                    aliases.alias_raw,
-                    aliases.alias_norm,
-                    aliases.alias_kind,
-                    faces.family_name,
-                    faces.full_name,
-                    faces.face_index,
-                    files.path,
-                    files.is_available
-                 FROM font_aliases aliases
-                 JOIN font_faces faces ON faces.id = aliases.face_id
-                 JOIN font_files files ON files.id = faces.file_id
-                 ORDER BY aliases.alias_norm ASC,
-                          files.path ASC,
-                          faces.face_index ASC,
-                          aliases.alias_kind ASC",
-            )
-            .context("failed to prepare alias CSV export")?;
+        let state = self.state.borrow();
+        let mut rows = Vec::new();
+        for alias in state.font_aliases.values() {
+            let Some(face) = state.font_faces.get(&alias.face_id) else {
+                continue;
+            };
+            let Some(file) = state.font_files.get(&face.file_id) else {
+                continue;
+            };
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok([
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    row.get::<_, i64>(5)?.to_string(),
-                    row.get::<_, String>(6)?,
-                    (row.get::<_, i64>(7)? != 0).to_string(),
-                ])
-            })
-            .context("failed to query alias CSV rows")?;
+            rows.push((
+                alias.alias_norm.clone(),
+                file.path.clone(),
+                face.face_index,
+                alias.alias_kind.clone(),
+                [
+                    alias.alias_raw.clone(),
+                    alias.alias_norm.clone(),
+                    alias.alias_kind.clone(),
+                    face.family_name.clone().unwrap_or_default(),
+                    face.full_name.clone().unwrap_or_default(),
+                    face.face_index.to_string(),
+                    file.path.clone(),
+                    file.is_available.to_string(),
+                ],
+            ));
+        }
 
-        for row in rows {
+        rows.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+
+        for (_, _, _, _, row) in rows {
             csv_writer
-                .write_record(row.context("failed to read alias CSV row")?)
+                .write_record(row)
                 .context("failed to write alias CSV row")?;
         }
 
@@ -441,6 +521,31 @@ impl FontIndex {
             .flush()
             .context("failed to flush alias CSV writer")?;
         Ok(())
+    }
+
+    fn replace_state(&self, state: IndexState) -> Result<()> {
+        *self.state.borrow_mut() = state;
+        self.save_state()
+    }
+
+    fn save_state(&self) -> Result<()> {
+        let data = serde_json::to_vec(&*self.state.borrow())
+            .context("failed to serialize redb font index state")?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to start redb font index write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(INDEX_STATE_TABLE)
+                .context("failed to open redb font index state table")?;
+            table
+                .insert(INDEX_STATE_KEY, data.as_slice())
+                .context("failed to write redb font index state")?;
+        }
+        write_txn
+            .commit()
+            .context("failed to commit redb font index write transaction")
     }
 }
 
@@ -470,99 +575,38 @@ pub fn normalize_font_name(name: &str) -> String {
         .to_owned()
 }
 
-fn initialize_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS index_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
+fn initialize_store(db: &Database) -> Result<()> {
+    let write_txn = db
+        .begin_write()
+        .context("failed to start redb font index initialization transaction")?;
+    {
+        write_txn
+            .open_table(INDEX_STATE_TABLE)
+            .context("failed to initialize redb font index state table")?;
+    }
+    write_txn
+        .commit()
+        .context("failed to commit redb font index initialization transaction")
+}
 
-        CREATE TABLE IF NOT EXISTS scan_roots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            root_path TEXT NOT NULL UNIQUE,
-            root_kind TEXT NOT NULL DEFAULT 'directory',
-            priority INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            last_scanned_at INTEGER
-        );
+fn load_state(db: &Database) -> Result<IndexState> {
+    let read_txn = db
+        .begin_read()
+        .context("failed to start redb font index read transaction")?;
+    let table = read_txn
+        .open_table(INDEX_STATE_TABLE)
+        .context("failed to open redb font index state table")?;
 
-        CREATE TABLE IF NOT EXISTS font_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            root_id INTEGER NOT NULL,
-            path TEXT NOT NULL,
-            canonical_path TEXT NOT NULL,
-            extension TEXT NOT NULL,
-            file_size INTEGER NOT NULL,
-            modified_at INTEGER NOT NULL,
-            content_hash TEXT,
-            is_available INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            FOREIGN KEY(root_id) REFERENCES scan_roots(id)
-        );
+    let state = match table
+        .get(INDEX_STATE_KEY)
+        .context("failed to read redb font index state")?
+    {
+        Some(value) => serde_json::from_slice(value.value())
+            .context("failed to deserialize redb font index state")?,
+        None => IndexState::default(),
+    };
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_font_files_canonical_path
-        ON font_files(canonical_path);
-
-        CREATE INDEX IF NOT EXISTS idx_font_files_root_id
-        ON font_files(root_id);
-
-        CREATE TABLE IF NOT EXISTS font_faces (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            face_index INTEGER NOT NULL DEFAULT 0,
-            family_name TEXT,
-            subfamily_name TEXT,
-            full_name TEXT,
-            postscript_name TEXT,
-            weight_class INTEGER,
-            width_class INTEGER,
-            is_italic INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            FOREIGN KEY(file_id) REFERENCES font_files(id)
-        );
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_font_faces_file_face
-        ON font_faces(file_id, face_index);
-
-        CREATE INDEX IF NOT EXISTS idx_font_faces_file_id
-        ON font_faces(file_id);
-
-        CREATE TABLE IF NOT EXISTS font_aliases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            face_id INTEGER NOT NULL,
-            alias_raw TEXT NOT NULL,
-            alias_norm TEXT NOT NULL,
-            alias_kind TEXT NOT NULL,
-            language TEXT,
-            platform_id INTEGER,
-            name_id INTEGER,
-            priority INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY(face_id) REFERENCES font_faces(id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_font_aliases_norm
-        ON font_aliases(alias_norm);
-
-        CREATE INDEX IF NOT EXISTS idx_font_aliases_face_id
-        ON font_aliases(face_id);
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_font_aliases_unique
-        ON font_aliases(
-            face_id,
-            alias_norm,
-            alias_kind,
-            COALESCE(language, ''),
-            COALESCE(platform_id, -1),
-            COALESCE(name_id, -1)
-        );
-        ",
-    )
-    .context("failed to initialize font index schema")
+    Ok(state)
 }
 
 pub fn canonicalize_font_root(root: &Path) -> Result<PathBuf> {
@@ -595,152 +639,136 @@ fn discover_font_paths(root: &Path, summary: &mut ScanSummary) -> Result<Vec<Pat
     Ok(font_paths)
 }
 
-fn upsert_scan_root(tx: &Transaction<'_>, root_path: &Path, now: i64) -> Result<i64> {
+fn upsert_scan_root(state: &mut IndexState, root_path: &Path, now: i64) -> u64 {
     let root_path = path_to_db_text(root_path);
-    tx.execute(
-        "INSERT INTO scan_roots (root_path, root_kind, priority, created_at, updated_at)
-         VALUES (?1, 'directory', 0, ?2, ?2)
-         ON CONFLICT(root_path) DO UPDATE SET
-            updated_at = excluded.updated_at",
-        params![root_path, now],
-    )
-    .context("failed to upsert scan root")?;
+    if let Some(root_id) = state.root_by_path.get(&root_path).copied() {
+        if let Some(root) = state.scan_roots.get_mut(&root_id) {
+            root.updated_at = now;
+        }
+        return root_id;
+    }
 
-    tx.query_row(
-        "SELECT id FROM scan_roots WHERE root_path = ?1",
-        params![root_path],
-        |row| row.get(0),
-    )
-    .context("failed to read scan root id")
+    let root_id = next_id(&mut state.next_root_id);
+    state.scan_roots.insert(
+        root_id,
+        ScanRootRecord {
+            root_path: root_path.clone(),
+            root_kind: "directory".to_owned(),
+            priority: 0,
+            created_at: now,
+            updated_at: now,
+            last_scanned_at: None,
+        },
+    );
+    state.root_by_path.insert(root_path, root_id);
+    root_id
 }
 
-fn find_existing_font_file(
-    tx: &Transaction<'_>,
-    canonical_path: &str,
-) -> Result<Option<ExistingFontFile>> {
-    tx.query_row(
-        "SELECT id, file_size, modified_at
-         FROM font_files
-         WHERE canonical_path = ?1",
-        params![canonical_path],
-        |row| {
-            Ok(ExistingFontFile {
-                id: row.get(0)?,
-                file_size: row.get(1)?,
-                modified_at: row.get(2)?,
-            })
-        },
-    )
-    .optional()
-    .context("failed to find indexed font file")
+fn find_existing_font_file(state: &IndexState, canonical_path: &str) -> Option<ExistingFontFile> {
+    let file_id = state.file_by_canonical_path.get(canonical_path).copied()?;
+    let file = state.font_files.get(&file_id)?;
+    Some(ExistingFontFile {
+        id: file_id,
+        file_size: file.file_size,
+        modified_at: file.modified_at,
+    })
 }
 
 fn mark_font_file_seen(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    root_id: i64,
+    state: &mut IndexState,
+    file_id: u64,
+    root_id: u64,
     path: &str,
     extension: &str,
     now: i64,
 ) -> Result<()> {
-    tx.execute(
-        "UPDATE font_files
-         SET root_id = ?1,
-             path = ?2,
-             extension = ?3,
-             is_available = 1,
-             updated_at = ?4
-         WHERE id = ?5",
-        params![root_id, path, extension, now, file_id],
-    )
-    .context("failed to mark indexed font file as available")?;
+    let file = state
+        .font_files
+        .get_mut(&file_id)
+        .context("indexed font file disappeared from redb state")?;
+    file.root_id = root_id;
+    file.path = path.to_owned();
+    file.extension = extension.to_owned();
+    file.is_available = true;
+    file.updated_at = now;
     Ok(())
 }
 
 fn upsert_font_file(
-    tx: &Transaction<'_>,
-    root_id: i64,
+    state: &mut IndexState,
+    root_id: u64,
     path: &str,
     canonical_path: &str,
     extension: &str,
     file_size: i64,
     modified_at: i64,
     now: i64,
-) -> Result<i64> {
-    tx.execute(
-        "INSERT INTO font_files (
+) -> u64 {
+    if let Some(file_id) = state.file_by_canonical_path.get(canonical_path).copied() {
+        if let Some(file) = state.font_files.get_mut(&file_id) {
+            file.root_id = root_id;
+            file.path = path.to_owned();
+            file.canonical_path = canonical_path.to_owned();
+            file.extension = extension.to_owned();
+            file.file_size = file_size;
+            file.modified_at = modified_at;
+            file.is_available = true;
+            file.updated_at = now;
+        }
+        return file_id;
+    }
+
+    let file_id = next_id(&mut state.next_file_id);
+    state.font_files.insert(
+        file_id,
+        FontFileRecord {
             root_id,
-            path,
-            canonical_path,
-            extension,
+            path: path.to_owned(),
+            canonical_path: canonical_path.to_owned(),
+            extension: extension.to_owned(),
             file_size,
             modified_at,
-            is_available,
-            created_at,
-            updated_at
-         )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)
-         ON CONFLICT(canonical_path) DO UPDATE SET
-            root_id = excluded.root_id,
-            path = excluded.path,
-            extension = excluded.extension,
-            file_size = excluded.file_size,
-            modified_at = excluded.modified_at,
-            is_available = 1,
-            updated_at = excluded.updated_at",
-        params![
-            root_id,
-            path,
-            canonical_path,
-            extension,
-            file_size,
-            modified_at,
-            now
-        ],
-    )
-    .context("failed to upsert font file")?;
-
-    tx.query_row(
-        "SELECT id FROM font_files WHERE canonical_path = ?1",
-        params![canonical_path],
-        |row| row.get(0),
-    )
-    .context("failed to read font file id")
+            is_available: true,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    state
+        .file_by_canonical_path
+        .insert(canonical_path.to_owned(), file_id);
+    file_id
 }
 
-fn remove_indexed_faces(tx: &Transaction<'_>, file_id: i64) -> Result<()> {
-    tx.execute(
-        "DELETE FROM font_aliases
-         WHERE face_id IN (SELECT id FROM font_faces WHERE file_id = ?1)",
-        params![file_id],
-    )
-    .context("failed to remove old font aliases")?;
-    tx.execute(
-        "DELETE FROM font_faces WHERE file_id = ?1",
-        params![file_id],
-    )
-    .context("failed to remove old font faces")?;
-    Ok(())
+fn remove_indexed_faces(state: &mut IndexState, file_id: u64) {
+    let Some(face_ids) = state.face_ids_by_file.remove(&file_id) else {
+        return;
+    };
+
+    for face_id in face_ids {
+        if let Some(alias_ids) = state.alias_ids_by_face.remove(&face_id) {
+            for alias_id in alias_ids {
+                remove_alias(state, alias_id);
+            }
+        }
+        state.font_faces.remove(&face_id);
+    }
 }
 
-fn insert_font_face(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    face: &FontFaceAnalysis,
-    now: i64,
-) -> Result<()> {
+fn insert_font_face(state: &mut IndexState, file_id: u64, face: &FontFaceAnalysis, now: i64) {
     let family_name = first_alias_for_name_id(face, name_id::FAMILY);
     let subfamily_name: Option<String> = None;
     let full_name = first_alias_for_name_id(face, name_id::FULL_NAME);
     let postscript_name = first_alias_for_name_id(face, name_id::POST_SCRIPT_NAME);
     let weight_class: Option<i64> = None;
     let width_class: Option<i64> = None;
-    let is_italic = 0i64;
+    let is_italic = false;
+    let face_id = next_id(&mut state.next_face_id);
 
-    tx.execute(
-        "INSERT INTO font_faces (
+    state.font_faces.insert(
+        face_id,
+        FontFaceRecord {
             file_id,
-            face_index,
+            face_index: face.face_index,
             family_name,
             subfamily_name,
             full_name,
@@ -748,35 +776,20 @@ fn insert_font_face(
             weight_class,
             width_class,
             is_italic,
-            created_at,
-            updated_at
-         )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-        params![
-            file_id,
-            i64::from(face.face_index),
-            family_name,
-            subfamily_name,
-            full_name,
-            postscript_name,
-            weight_class,
-            width_class,
-            is_italic,
-            now
-        ],
-    )
-    .context("failed to insert font face")?;
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    state
+        .face_ids_by_file
+        .entry(file_id)
+        .or_default()
+        .push(face_id);
 
-    let face_id = tx.last_insert_rowid();
-    insert_font_aliases(tx, face_id, &face.aliases, now)
+    insert_font_aliases(state, face_id, &face.aliases, now);
 }
 
-fn insert_font_aliases(
-    tx: &Transaction<'_>,
-    face_id: i64,
-    aliases: &[FontAlias],
-    now: i64,
-) -> Result<()> {
+fn insert_font_aliases(state: &mut IndexState, face_id: u64, aliases: &[FontAlias], now: i64) {
     let mut seen = HashSet::new();
 
     for alias in aliases {
@@ -803,82 +816,74 @@ fn insert_font_aliases(
                 continue;
             }
 
-            tx.execute(
-                "INSERT OR IGNORE INTO font_aliases (
+            let alias_id = next_id(&mut state.next_alias_id);
+            state.font_aliases.insert(
+                alias_id,
+                FontAliasRecord {
                     face_id,
                     alias_raw,
-                    alias_norm,
-                    alias_kind,
-                    language,
+                    alias_norm: alias_norm.clone(),
+                    alias_kind: alias_kind.to_owned(),
+                    language: language.clone(),
                     platform_id,
                     name_id,
                     priority,
-                    created_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    face_id,
-                    alias_raw,
-                    alias_norm,
-                    alias_kind,
-                    language,
-                    platform_id,
-                    name_id,
-                    priority,
-                    now
-                ],
-            )
-            .context("failed to insert font alias")?;
+                    created_at: now,
+                },
+            );
+            state
+                .alias_ids_by_face
+                .entry(face_id)
+                .or_default()
+                .push(alias_id);
+            state
+                .alias_ids_by_norm
+                .entry(alias_norm)
+                .or_default()
+                .push(alias_id);
         }
     }
-
-    Ok(())
 }
 
 fn mark_unavailable_files(
-    tx: &Transaction<'_>,
-    root_id: i64,
+    state: &mut IndexState,
+    root_id: u64,
     seen_paths: &HashSet<String>,
     now: i64,
-) -> Result<usize> {
-    let indexed_files = {
-        let mut stmt = tx
-            .prepare(
-                "SELECT id, canonical_path
-                 FROM font_files
-                 WHERE root_id = ?1
-                   AND is_available = 1",
-            )
-            .context("failed to prepare unavailable font query")?;
-
-        let rows = stmt
-            .query_map(params![root_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .context("failed to query unavailable font candidates")?;
-
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to read unavailable font candidates")?
-    };
-
+) -> usize {
     let mut unavailable_files = 0usize;
-    for (file_id, canonical_path) in indexed_files {
-        if seen_paths.contains(&canonical_path) {
+    for file in state.font_files.values_mut() {
+        if file.root_id != root_id
+            || !file.is_available
+            || seen_paths.contains(&file.canonical_path)
+        {
             continue;
         }
 
-        tx.execute(
-            "UPDATE font_files
-             SET is_available = 0,
-                 updated_at = ?1
-             WHERE id = ?2",
-            params![now, file_id],
-        )
-        .context("failed to mark font file unavailable")?;
+        file.is_available = false;
+        file.updated_at = now;
         unavailable_files += 1;
     }
 
-    Ok(unavailable_files)
+    unavailable_files
+}
+
+fn remove_alias(state: &mut IndexState, alias_id: u64) {
+    let Some(alias) = state.font_aliases.remove(&alias_id) else {
+        return;
+    };
+
+    let should_remove = if let Some(alias_ids) = state.alias_ids_by_norm.get_mut(&alias.alias_norm)
+    {
+        alias_ids.retain(|candidate| *candidate != alias_id);
+        alias_ids.is_empty()
+    } else {
+        false
+    };
+
+    if should_remove {
+        state.alias_ids_by_norm.remove(&alias.alias_norm);
+    }
 }
 
 fn first_alias_for_name_id(face: &FontFaceAnalysis, name_id: u16) -> Option<String> {
@@ -934,6 +939,16 @@ fn alias_raw_variants(value: &str) -> Vec<String> {
     variants
 }
 
+fn next_id(counter: &mut u64) -> u64 {
+    if *counter == 0 {
+        *counter = 1;
+    }
+
+    let id = *counter;
+    *counter = counter.saturating_add(1);
+    id
+}
+
 fn canonicalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -957,14 +972,6 @@ fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn i64_to_u32(value: i64) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
-}
-
 fn i64_to_u16(value: i64) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
-}
-
-fn i64_to_usize(value: i64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
 }
