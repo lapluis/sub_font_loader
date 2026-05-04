@@ -58,6 +58,18 @@ Options:
 - `--no-hold`: unload immediately after loading instead of waiting
 - `--keep-extracted`: keep the temporary extraction directory for archive input
 
+### `system_font_families`
+
+List font families currently visible through the Windows GDI font APIs. This is useful for confirming that temporarily loaded fonts are visible to other programs.
+
+```powershell
+cargo run --bin system_font_families
+cargo run --bin system_font_families -- "Noto Sans"
+cargo run --bin system_font_families -- --include-vertical
+```
+
+By default, GDI vertical aliases whose names start with `@` are skipped.
+
 ### `subtitle_fonts`
 
 Analyze ASS/SSA subtitle files and print the fonts they require without loading anything.
