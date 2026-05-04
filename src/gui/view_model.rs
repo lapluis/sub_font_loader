@@ -12,8 +12,10 @@ pub struct SubtitleLoadView {
     pub declared_but_unused_alias_count: usize,
     pub skipped_system_alias_count: usize,
     pub loaded_local_font_count: usize,
+    pub failed_local_font_count: usize,
     pub missing_alias_count: usize,
     pub local_groups: Vec<LocalFontGroup>,
+    pub failed_local_fonts: Vec<FailedLocalFont>,
     pub declared_but_unused_aliases: Vec<String>,
     pub system_aliases: Vec<String>,
     pub missing_aliases: Vec<String>,
@@ -24,6 +26,12 @@ pub struct LocalFontGroup {
     pub font_path: PathBuf,
     pub loaded: bool,
     pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FailedLocalFont {
+    pub font_path: PathBuf,
+    pub error: String,
 }
 
 impl SubtitleLoadView {
@@ -57,6 +65,15 @@ impl SubtitleLoadView {
         local_groups.retain(|group| group.loaded);
 
         let loaded_local_font_count = local_groups.iter().filter(|group| group.loaded).count();
+        let failed_local_fonts = load_summary
+            .failed
+            .iter()
+            .map(|failure| FailedLocalFont {
+                font_path: failure.path.clone(),
+                error: failure.error.clone(),
+            })
+            .collect::<Vec<_>>();
+        let failed_local_font_count = failed_local_fonts.len();
         let missing_aliases = report.missing;
         let missing_alias_count = missing_aliases.len();
         let declared_but_unused_alias_count = declared_but_unused_aliases.len();
@@ -68,8 +85,10 @@ impl SubtitleLoadView {
             declared_but_unused_alias_count,
             skipped_system_alias_count,
             loaded_local_font_count,
+            failed_local_font_count,
             missing_alias_count,
             local_groups,
+            failed_local_fonts,
             declared_but_unused_aliases,
             system_aliases,
             missing_aliases,
@@ -83,6 +102,12 @@ impl SubtitleLoadView {
             &mut output,
             format!("Loaded local fonts: {}", self.loaded_local_font_count),
         );
+        if self.failed_local_font_count > 0 {
+            push_line(
+                &mut output,
+                format!("Failed local fonts: {}", self.failed_local_font_count),
+            );
+        }
         push_line(
             &mut output,
             format!("Skipped system fonts: {}", self.skipped_system_alias_count),
@@ -120,6 +145,21 @@ impl SubtitleLoadView {
             }
         }
         output.push('\n');
+
+        if !self.failed_local_fonts.is_empty() {
+            push_line(&mut output, "[LOCAL LOAD FAILED]".to_owned());
+            for failure in &self.failed_local_fonts {
+                push_line(
+                    &mut output,
+                    format!("- {}", font_file_label(&failure.font_path)),
+                );
+
+                for line in failure.error.lines() {
+                    push_line(&mut output, format!("  {line}"));
+                }
+            }
+            output.push('\n');
+        }
 
         push_line(&mut output, "[SYSTEM SKIPPED]".to_owned());
         for alias in &self.system_aliases {
@@ -168,7 +208,7 @@ mod tests {
     use super::SubtitleLoadView;
     use crate::{
         font::index::{FontMatch, ResolveReport, ResolvedFont},
-        session::{LoadSummary, LoadedFont},
+        session::{FailedFont, LoadSummary, LoadedFont},
     };
     use std::path::PathBuf;
 
@@ -233,6 +273,48 @@ mod tests {
                 "- Unused Display\n",
             )
         );
+    }
+
+    #[test]
+    fn render_text_includes_failed_load_section_when_needed() {
+        let loaded_path = PathBuf::from("Fonts").join("Alpha.ttf");
+        let failed_path = PathBuf::from("Fonts").join("Beta.ttf");
+        let report = ResolveReport {
+            matched: vec![
+                ResolvedFont {
+                    requested_name: "Alpha Family".to_owned(),
+                    matches: vec![font_match(&loaded_path, "Alpha Family", "family")],
+                },
+                ResolvedFont {
+                    requested_name: "Beta Family".to_owned(),
+                    matches: vec![font_match(&failed_path, "Beta Family", "family")],
+                },
+            ],
+            missing: Vec::new(),
+            unique_font_paths: vec![loaded_path.clone(), failed_path.clone()],
+        };
+        let load_summary = LoadSummary {
+            loaded: vec![LoadedFont { path: loaded_path }],
+            failed: vec![FailedFont {
+                path: failed_path,
+                error: "failed to add font resource".to_owned(),
+            }],
+        };
+
+        let rendered = SubtitleLoadView::from_resolve_report(
+            1,
+            2,
+            Vec::new(),
+            Vec::new(),
+            report,
+            &load_summary,
+        )
+        .render_text();
+
+        assert!(rendered.contains("Failed local fonts: 1\n"));
+        assert!(rendered.contains("[LOCAL LOAD FAILED]\n"));
+        assert!(rendered.contains("- Beta.ttf\n"));
+        assert!(rendered.contains("  failed to add font resource\n"));
     }
 
     fn font_match(path: &PathBuf, matched_alias: &str, alias_kind: &str) -> FontMatch {
