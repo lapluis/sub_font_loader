@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     discover,
-    font::index::{FontIndex, ScanSummary, canonicalize_font_root, normalize_font_name},
+    font::index::{
+        FontIndex, FontIndexInspection, ScanSummary, canonicalize_font_root,
+        inspect_existing_index, normalize_font_name,
+    },
     session::FontSession,
     subtitle,
 };
@@ -28,6 +31,7 @@ pub enum GuiTask {
     },
     LoadSubtitleInputs {
         inputs: Vec<PathBuf>,
+        font_root: PathBuf,
         db_path: PathBuf,
         avoid_system_fonts: bool,
         current_session: FontSession,
@@ -41,6 +45,9 @@ pub enum GuiTask {
 pub enum GuiEvent {
     IndexReady {
         summary: ScanSummary,
+    },
+    IndexUnavailable {
+        inspection: FontIndexInspection,
     },
     IndexFailed {
         error: String,
@@ -78,29 +85,17 @@ pub fn run_task(task: GuiTask) -> GuiEvent {
     }
 }
 
-pub fn inspect_index_status(font_root: &Path, db_path: &Path) -> Result<Option<ScanSummary>> {
-    if !db_path.exists() {
-        return Ok(None);
-    }
-
-    let index = FontIndex::open(db_path)?;
-    let Some(active_root) = index.active_font_root()? else {
-        return Ok(None);
-    };
-
-    let font_root = canonicalize_font_root(font_root)?;
-    if paths_equal(&active_root, &font_root) {
-        Ok(Some(index.summary_for_root(&font_root)?))
-    } else {
-        Ok(None)
-    }
+pub fn inspect_index_status(font_root: &Path, db_path: &Path) -> Result<FontIndexInspection> {
+    inspect_existing_index(db_path, font_root)
 }
 
 fn run_task_inner(task: GuiTask) -> Result<GuiEvent> {
     match task {
         GuiTask::EnsureIndexOnStartup { font_root, db_path } => {
-            let summary = ensure_index_on_startup(&font_root, &db_path)?;
-            Ok(GuiEvent::IndexReady { summary })
+            match ensure_index_on_startup(&font_root, &db_path)? {
+                FontIndexInspection::Ready(summary) => Ok(GuiEvent::IndexReady { summary }),
+                inspection => Ok(GuiEvent::IndexUnavailable { inspection }),
+            }
         }
         GuiTask::UpdateIndex { font_root, db_path } => {
             let summary = update_index(&font_root, &db_path)?;
@@ -124,12 +119,18 @@ fn run_task_inner(task: GuiTask) -> Result<GuiEvent> {
         }
         GuiTask::LoadSubtitleInputs {
             inputs,
+            font_root,
             db_path,
             avoid_system_fonts,
             mut current_session,
         } => {
-            let loaded =
-                load_subtitles(inputs, &db_path, avoid_system_fonts, &mut current_session)?;
+            let loaded = load_subtitles(
+                inputs,
+                &font_root,
+                &db_path,
+                avoid_system_fonts,
+                &mut current_session,
+            )?;
             Ok(GuiEvent::FontsLoaded {
                 view: loaded.view,
                 session: current_session,
@@ -145,20 +146,18 @@ fn run_task_inner(task: GuiTask) -> Result<GuiEvent> {
     }
 }
 
-fn ensure_index_on_startup(font_root: &Path, db_path: &Path) -> Result<ScanSummary> {
-    let db_exists = db_path.exists();
-    let mut index = FontIndex::open(db_path)?;
+fn ensure_index_on_startup(font_root: &Path, db_path: &Path) -> Result<FontIndexInspection> {
     let font_root = canonicalize_font_root(font_root)?;
 
-    if !db_exists {
-        return index.rebuild_root(&font_root);
-    }
-
-    match index.active_font_root()? {
-        Some(active_root) if paths_equal(&active_root, &font_root) => {
-            index.update_bound_root(&font_root)
+    match inspect_index_status(&font_root, db_path)? {
+        FontIndexInspection::Ready(summary) => Ok(FontIndexInspection::Ready(summary)),
+        FontIndexInspection::RootMismatch { .. } | FontIndexInspection::MissingMetadata => {
+            let mut index = FontIndex::open(db_path)?;
+            index
+                .rebuild_root(&font_root)
+                .map(FontIndexInspection::Ready)
         }
-        _ => index.rebuild_root(&font_root),
+        inspection @ FontIndexInspection::OutdatedSchema { .. } => Ok(inspection),
     }
 }
 
@@ -180,10 +179,13 @@ struct SubtitleLoadResult {
 
 fn load_subtitles(
     inputs: Vec<PathBuf>,
+    font_root: &Path,
     db_path: &Path,
     avoid_system_fonts: bool,
     session: &mut FontSession,
 ) -> Result<SubtitleLoadResult> {
+    ensure_index_can_load(font_root, db_path)?;
+
     let subtitles =
         discover::discover_subtitle_paths(&inputs).context("failed to discover subtitles")?;
     if subtitles.is_empty() {
@@ -231,9 +233,79 @@ fn load_subtitles(
     Ok(SubtitleLoadResult { view })
 }
 
+fn ensure_index_can_load(font_root: &Path, db_path: &Path) -> Result<()> {
+    match inspect_index_status(font_root, db_path)? {
+        FontIndexInspection::Ready(_) => Ok(()),
+        FontIndexInspection::RootMismatch {
+            indexed_root,
+            configured_root,
+        } => bail!(
+            "font index is bound to {}; build the index for {} before loading subtitles",
+            indexed_root.display(),
+            configured_root.display()
+        ),
+        FontIndexInspection::MissingMetadata => {
+            bail!("font index is missing; build the index before loading subtitles")
+        }
+        FontIndexInspection::OutdatedSchema { schema_version } => bail!(
+            "font index schema version {schema_version} is outdated; rebuild the index before loading subtitles"
+        ),
+    }
+}
+
 fn paths_equal(left: &Path, right: &Path) -> bool {
     left == right
         || left
             .to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs, thread,
+        time::{Duration, SystemTime},
+    };
+
+    use super::*;
+
+    #[test]
+    fn inspect_missing_index_does_not_create_database() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let font_root = temp_dir.path().join("fonts");
+        let db_path = temp_dir.path().join("font_index.redb");
+        fs::create_dir(&font_root)?;
+
+        let inspection = inspect_index_status(&font_root, &db_path)?;
+
+        assert!(matches!(inspection, FontIndexInspection::MissingMetadata));
+        assert!(!db_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_with_matching_index_does_not_modify_database() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let font_root = temp_dir.path().join("fonts");
+        let db_path = temp_dir.path().join("font_index.redb");
+        fs::create_dir(&font_root)?;
+
+        {
+            let mut index = FontIndex::open(&db_path)?;
+            index.rebuild_root(&font_root)?;
+        }
+
+        let before_modified = modified_at(&db_path)?;
+        thread::sleep(Duration::from_millis(20));
+
+        let inspection = ensure_index_on_startup(&font_root, &db_path)?;
+
+        assert!(matches!(inspection, FontIndexInspection::Ready(_)));
+        assert_eq!(before_modified, modified_at(&db_path)?);
+        Ok(())
+    }
+
+    fn modified_at(path: &Path) -> Result<SystemTime> {
+        Ok(fs::metadata(path)?.modified()?)
+    }
 }

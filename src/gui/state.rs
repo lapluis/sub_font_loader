@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::{font::index::ScanSummary, session::FontSession};
+use crate::{
+    font::index::{FontIndexInspection, ScanSummary},
+    session::FontSession,
+};
 
 use super::{commands, config::GuiConfig, view_model::SubtitleLoadView};
 
@@ -56,6 +59,13 @@ pub enum IndexStatus {
     Unknown,
     DisabledByConfig,
     Missing,
+    OutdatedSchema {
+        schema_version: u32,
+    },
+    RootMismatch {
+        indexed_root: PathBuf,
+        configured_root: PathBuf,
+    },
     Building,
     Ready {
         font_root: PathBuf,
@@ -75,15 +85,71 @@ impl IndexStatus {
         }
     }
 
+    pub fn from_inspection(inspection: FontIndexInspection) -> Self {
+        match inspection {
+            FontIndexInspection::Ready(summary) => Self::from_summary(&summary),
+            FontIndexInspection::MissingMetadata => Self::Missing,
+            FontIndexInspection::OutdatedSchema { schema_version } => {
+                Self::OutdatedSchema { schema_version }
+            }
+            FontIndexInspection::RootMismatch {
+                indexed_root,
+                configured_root,
+            } => Self::RootMismatch {
+                indexed_root,
+                configured_root,
+            },
+        }
+    }
+
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
+    }
+
+    pub fn load_block_message(&self) -> String {
+        match self {
+            Self::RootMismatch {
+                indexed_root,
+                configured_root,
+            } => format!(
+                "Build the index for {} before loading subtitles. Current index is bound to {}.",
+                configured_root.display(),
+                indexed_root.display()
+            ),
+            Self::OutdatedSchema { schema_version } => format!(
+                "Rebuild the outdated font index before loading subtitles. Current schema version: {schema_version}."
+            ),
+            Self::DisabledByConfig => "Build the font index before loading subtitles.".to_owned(),
+            Self::Missing => "Build the font index before loading subtitles.".to_owned(),
+            Self::Failed(error) => {
+                format!("Fix the font index error before loading subtitles: {error}")
+            }
+            _ => "Build or update the font index first.".to_owned(),
+        }
     }
 
     pub fn status_text(&self) -> String {
         match self {
             Self::Unknown => "Index status: unknown".to_owned(),
-            Self::DisabledByConfig => "Index status: startup indexing disabled".to_owned(),
-            Self::Missing => "Index status: missing or bound to another font directory".to_owned(),
+            Self::DisabledByConfig => {
+                "Index status: startup indexing disabled; build the index before loading subtitles"
+                    .to_owned()
+            }
+            Self::Missing => {
+                "Index status: missing or invalid; build the index before loading subtitles"
+                    .to_owned()
+            }
+            Self::OutdatedSchema { schema_version } => format!(
+                "Index status: schema version {schema_version} is outdated; rebuild the index before loading subtitles"
+            ),
+            Self::RootMismatch {
+                indexed_root,
+                configured_root,
+            } => format!(
+                "Index status: bound to {}; build the index for {} before loading subtitles",
+                indexed_root.display(),
+                configured_root.display()
+            ),
             Self::Building => "Index status: rebuilding".to_owned(),
             Self::Ready {
                 font_root,

@@ -223,9 +223,10 @@ impl MainWindow {
             } else {
                 state.index_status =
                     match worker::inspect_index_status(&state.font_root, &state.db_path) {
-                        Ok(Some(summary)) => IndexStatus::from_summary(&summary),
-                        Ok(None) if state.db_path.exists() => IndexStatus::Missing,
-                        Ok(None) => IndexStatus::DisabledByConfig,
+                        Ok(inspection) if state.db_path.exists() => {
+                            IndexStatus::from_inspection(inspection)
+                        }
+                        Ok(_) => IndexStatus::DisabledByConfig,
                         Err(error) => IndexStatus::Failed(format!("{error:#}")),
                     };
                 false
@@ -317,10 +318,10 @@ impl MainWindow {
             }
 
             if !state.index_status.is_ready() {
-                state.load_status =
-                    LoadStatus::Failed("build or update the font index first".to_owned());
+                let message = state.index_status.load_block_message();
+                state.load_status = LoadStatus::Failed(message.clone());
                 self.update_ui(&state);
-                self.show_message("Build or update the font index first.");
+                self.show_message(&message);
                 return;
             }
 
@@ -331,6 +332,7 @@ impl MainWindow {
 
             GuiTask::LoadSubtitleInputs {
                 inputs,
+                font_root: state.font_root.clone(),
                 db_path: state.db_path.clone(),
                 avoid_system_fonts: state.config.avoid_system_fonts,
                 current_session: state.font_session.take().unwrap_or_default(),
@@ -403,6 +405,9 @@ impl MainWindow {
                 }
                 GuiEvent::IndexFailed { error } => {
                     state.index_status = IndexStatus::Failed(error);
+                }
+                GuiEvent::IndexUnavailable { inspection } => {
+                    state.index_status = IndexStatus::from_inspection(inspection);
                 }
                 GuiEvent::FontRootSwitched {
                     summary,

@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableError,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -91,6 +93,19 @@ pub struct ScanSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontIndexInspection {
+    Ready(ScanSummary),
+    MissingMetadata,
+    OutdatedSchema {
+        schema_version: u32,
+    },
+    RootMismatch {
+        indexed_root: PathBuf,
+        configured_root: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontMatch {
     pub requested_name: String,
     pub matched_name: String,
@@ -129,9 +144,25 @@ struct DiscoveredFontPath {
 
 impl FontIndex {
     pub fn open(db_path: &Path) -> Result<Self> {
-        let db = Database::create(db_path)
-            .with_context(|| format!("failed to open redb font index {}", db_path.display()))?;
-        initialize_store(&db)?;
+        let needs_create = match fs::metadata(db_path) {
+            Ok(metadata) => metadata.len() == 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect redb font index {}", db_path.display())
+                });
+            }
+        };
+
+        let db = if needs_create {
+            let db = Database::create(db_path)
+                .with_context(|| format!("failed to open redb font index {}", db_path.display()))?;
+            initialize_store(&db)?;
+            db
+        } else {
+            Database::open(db_path)
+                .with_context(|| format!("failed to open redb font index {}", db_path.display()))?
+        };
 
         Ok(Self { db })
     }
@@ -321,20 +352,7 @@ impl FontIndex {
             });
         }
 
-        let total_font_files = usize::try_from(meta.total_font_files).unwrap_or(usize::MAX);
-        let mut summary = ScanSummary {
-            root: root_path.clone(),
-            indexed_files: total_font_files,
-            ..ScanSummary::default()
-        };
-        let font_paths = discover_font_paths(&root_path, &mut summary)?;
-        summary.scanned_files = font_paths.len();
-
-        if summary.indexed_files > summary.scanned_files {
-            summary.unavailable_files = summary.indexed_files - summary.scanned_files;
-        }
-
-        Ok(summary)
+        summary_from_meta_for_root(&meta, root_path)
     }
 
     pub fn query_name(&self, font_name: &str) -> Result<Vec<FontMatch>> {
@@ -662,6 +680,52 @@ impl FontIndex {
     }
 }
 
+pub fn inspect_existing_index(db_path: &Path, root: &Path) -> Result<FontIndexInspection> {
+    let metadata = match fs::metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FontIndexInspection::MissingMetadata);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect redb font index {}", db_path.display())
+            });
+        }
+    };
+
+    if metadata.len() == 0 {
+        return Ok(FontIndexInspection::MissingMetadata);
+    }
+
+    let root_path = canonicalize_font_root(root)?;
+
+    let db = ReadOnlyDatabase::open(db_path)
+        .with_context(|| format!("failed to open redb font index {}", db_path.display()))?;
+    let read_txn = db
+        .begin_read()
+        .context("failed to start redb font index read transaction")?;
+    let Some(meta) = read_meta_record_from_txn(&read_txn)? else {
+        return Ok(FontIndexInspection::MissingMetadata);
+    };
+
+    if !paths_equal_text(&meta.root_path, &path_to_db_text(&root_path)) {
+        return Ok(FontIndexInspection::RootMismatch {
+            indexed_root: PathBuf::from(meta.root_path),
+            configured_root: root_path,
+        });
+    }
+
+    if meta.schema_version != SCHEMA_VERSION {
+        return Ok(FontIndexInspection::OutdatedSchema {
+            schema_version: meta.schema_version,
+        });
+    }
+
+    Ok(FontIndexInspection::Ready(summary_from_meta_for_root(
+        &meta, root_path,
+    )?))
+}
+
 pub fn normalize_font_name(name: &str) -> String {
     let normalized = name.trim().nfkc().collect::<String>();
     let mut collapsed = String::new();
@@ -719,10 +783,29 @@ fn initialize_store(db: &Database) -> Result<()> {
         .context("failed to commit redb font index initialization transaction")
 }
 
+fn summary_from_meta_for_root(meta: &MetaRecord, root_path: PathBuf) -> Result<ScanSummary> {
+    let total_font_files = usize::try_from(meta.total_font_files).unwrap_or(usize::MAX);
+    let mut summary = ScanSummary {
+        root: root_path.clone(),
+        indexed_files: total_font_files,
+        ..ScanSummary::default()
+    };
+    let font_paths = discover_font_paths(&root_path, &mut summary)?;
+    summary.scanned_files = font_paths.len();
+
+    if summary.indexed_files > summary.scanned_files {
+        summary.unavailable_files = summary.indexed_files - summary.scanned_files;
+    }
+
+    Ok(summary)
+}
+
 fn read_meta_record_from_txn(read_txn: &redb::ReadTransaction) -> Result<Option<MetaRecord>> {
-    let meta_table = read_txn
-        .open_table(META_TABLE)
-        .context("failed to open redb font index meta table")?;
+    let meta_table = match read_txn.open_table(META_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(error) => return Err(error).context("failed to open redb font index meta table"),
+    };
     meta_table
         .get(META_KEY)
         .context("failed to read redb font index metadata")?
